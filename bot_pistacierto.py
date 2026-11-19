@@ -67,11 +67,11 @@ def es_equipo_valido(titulo):
     ]
     return any(c in up for c in claves_ok)
 
-def normalizar_mayorista(raw_name, imgs_info=None, texto_fila=""):
-    combinado = f"{raw_name or ''} {texto_fila or ''}".upper()
+def normalizar_mayorista(imgs_info=None, texto_fila="", html_fila=""):
+    combinado = f"{texto_fila or ''} {html_fila or ''}".upper()
     if imgs_info:
-        for alt, title, src in imgs_info:
-            combinado += f" {alt or ''} {title or ''} {src or ''}".upper()
+        for item in imgs_info:
+            combinado += " " + " ".join(str(x or "") for x in item).upper()
 
     mapa = [
         ("PISTACERO", "PISTACERO (Compra Agrupada)"),
@@ -80,7 +80,9 @@ def normalizar_mayorista(raw_name, imgs_info=None, texto_fila=""):
         ("GRUPO SII", "Idiomund"),
         ("TD SYNNEX", "TD SYNNEX"),
         ("TDSYNNEX", "TD SYNNEX"),
+        ("SYNNEX", "TD SYNNEX"),
         ("TECH DATA", "TD SYNNEX"),
+        ("TECHDATA", "TD SYNNEX"),
         ("DEPAU", "Depau"),
         ("INFORPOR", "Inforpor"),
         ("ESPRINET", "Esprinet"),
@@ -97,27 +99,31 @@ def normalizar_mayorista(raw_name, imgs_info=None, texto_fila=""):
         ("ARROW", "Arrow"),
         ("DMI", "DMI Computer"),
         ("TICNOVA", "Ticnova"),
+        ("ALSO", "ALSO"),
+        ("WESTCON", "Westcon"),
+        ("EXERTIS", "Exertis"),
+        ("DESPEC", "Despec"),
+        ("INFORTISA", "Infortisa"),
+        ("UNYKA", "Unyka"),
     ]
     for clave, nombre_limpio in mapa:
         if clave in combinado:
             return nombre_limpio
 
-    if raw_name and str(raw_name).strip() and not str(raw_name).strip().isdigit():
-        return str(raw_name).strip()
-
     if imgs_info:
-        for alt, title, src in imgs_info:
+        for alt, title, src, data_src in imgs_info:
             for cand in [alt, title]:
                 c = (cand or "").strip()
-                if c and len(c) > 1 and not any(x in c.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon"]):
+                if c and len(c) > 1 and not any(x in c.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon", "carrito", "añadir"]):
                     return c
-            if src:
-                archivo = src.split("/")[-1].split("?")[0]
-                nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
-                nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
-                nombre = re.sub(r"[-_]", " ", nombre).strip()
-                if nombre and len(nombre) > 1 and not nombre.isdigit():
-                    return nombre
+            for url_img in [src, data_src]:
+                if url_img and not url_img.startswith("data:"):
+                    archivo = url_img.split("/")[-1].split("?")[0]
+                    nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
+                    nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
+                    nombre = re.sub(r"[-_]", " ", nombre).strip()
+                    if nombre and len(nombre) > 1 and not nombre.isdigit():
+                        return nombre.upper() if len(nombre) <= 4 else nombre.title()
 
     return "Mayorista Desconocido"
 
@@ -142,32 +148,12 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
     async with sem:
         page = await context.new_page()
         filas_resultado = []
-        respuestas_json = []
-
-        async def on_response(response):
-            try:
-                if "pistacero" in response.url or "pistacierto" in response.url:
-                    ct = response.headers.get("content-type", "")
-                    if "application/json" in ct and response.status == 200:
-                        data = await response.json()
-                        respuestas_json.append((response.url, data))
-            except Exception:
-                pass
-
-        page.on("response", on_response)
 
         try:
             await page.goto(url_prod, wait_until="domcontentloaded", timeout=35000)
             await page.wait_for_timeout(2500)
             await cerrar_popups(page)
 
-            if idx == 0:
-                log(f"   [Diagnóstico Ficha 1] URL: {url_prod} | JSONs capturados: {len(respuestas_json)}")
-                for j_idx, (j_url, j_data) in enumerate(respuestas_json):
-                    resumen = json.dumps(j_data, ensure_ascii=False)[:450]
-                    log(f"      -> JSON #{j_idx+1} ({j_url.split('?')[0]}): {resumen}")
-
-            # Extraer todo el texto e imágenes del bloque de ofertas de la ficha
             datos_dom = await page.evaluate("""() => {
                 const bodyTxt = document.body.innerText || "";
                 const h1 = document.querySelector("h1, h2, .product-title, .titulo-producto");
@@ -177,39 +163,52 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 const mPn = bodyTxt.match(/P\\/N:\\s*([A-Z0-9\\-\\.]+)/i);
                 if (mPn) pn = mPn[1].trim();
 
-                // Capturar todos los bloques que tengan un precio decimal (ej: 608,42) en la ficha
+                // Localizar cada nodo de precio decimal (ej: 269,00) y subir hasta su fila completa (tr o div con <img>)
                 const bloques = [];
-                const todos = Array.from(document.querySelectorAll("div, tr, li")).filter(el => {
+                const hojasPrecio = Array.from(document.querySelectorAll("div, span, td, p, strong, b")).filter(el => {
                     const t = (el.innerText || "").trim();
-                    return /\\d[\\d\\.]*,\\d{2}/.test(t) && t.length < 400;
+                    return el.children.length === 0 && /^\\d[\\d\\.]*,\\d{2}\\s*€?$/.test(t);
                 });
 
-                const vistos = new Set();
-                for (const el of todos) {
-                    const t = (el.innerText || "").trim();
-                    if (vistos.has(t)) continue;
-                    const hijos = Array.from(el.querySelectorAll("div, tr, li")).filter(h => {
-                        const ht = (h.innerText || "").trim();
-                        return /\\d[\\d\\.]*,\\d{2}/.test(ht) && ht.length < 400;
-                    });
-                    if (hijos.length > 0) continue;
-                    vistos.add(t);
+                const filasVistas = new Set();
+                for (const hoja of hojasPrecio) {
+                    // Subir hasta el <tr> o contenedor de fila individual que incluye logo <img> + precio + stock + botón
+                    let fila = hoja.closest("tr");
+                    if (!fila) {
+                        let cur = hoja.parentElement;
+                        for (let nivel = 0; nivel < 6 && cur; nivel++) {
+                            const imgs = cur.querySelectorAll("img").length;
+                            const preciosEnFila = (cur.innerText || "").match(/\\d[\\d\\.]*,\\d{2}/g) || [];
+                            // Si engloba varios mayoristas distintos (más de 3 precios incluyendo canon), parar antes
+                            if (preciosEnFila.length > 3) break;
+                            if (imgs > 0) {
+                                fila = cur;
+                                break;
+                            }
+                            cur = cur.parentElement;
+                        }
+                    }
 
-                    // Subir 1 o 2 niveles para coger también el logo <img> del mayorista de esa fila
-                    const padre = el.parentElement || el;
-                    const imgs = Array.from(padre.querySelectorAll("img")).map(img => [
+                    const contenedor = fila || hoja.parentElement?.parentElement || hoja.parentElement;
+                    if (!contenedor || filasVistas.has(contenedor)) continue;
+                    filasVistas.add(contenedor);
+
+                    const imgs = Array.from(contenedor.querySelectorAll("img")).map(img => [
                         img.alt || "",
                         img.title || "",
-                        img.src || ""
+                        img.src || "",
+                        img.getAttribute("data-src") || ""
                     ]);
-                    bloques.push({ texto: (padre.innerText || t).trim(), imgs: imgs });
+
+                    bloques.push({
+                        texto: (contenedor.innerText || "").trim(),
+                        imgs: imgs,
+                        html: contenedor.outerHTML.slice(0, 700)
+                    });
                 }
 
-                return { titulo: titulo, pn: pn, bloques: bloques, bodyMuestra: bodyTxt.slice(0, 1200) };
+                return { titulo: titulo, pn: pn, bloques: bloques };
             }""")
-
-            if idx == 0:
-                log(f"      -> Muestra texto Ficha 1: {datos_dom['bodyMuestra'].replace(chr(10), ' | ')[:450]}")
 
             titulo_final = datos_dom["titulo"] or titulo_previo
             pn_final = datos_dom["pn"]
@@ -217,13 +216,13 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{4,10}-[A-Z0-9]{4,10})\b", titulo_final)
                 pn_final = m_pn_tit.group(1) if m_pn_tit else titulo_final[:35]
 
-            # Parsear las ofertas desde los bloques capturados en la ficha
             ofertas_ficha = {}
             for b in datos_dom["bloques"]:
                 txt = b["texto"]
-                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock)", txt, re.I):
+                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir)", txt, re.I):
                     continue
-                mayorista = normalizar_mayorista("", b["imgs"], txt)
+
+                mayorista = normalizar_mayorista(b["imgs"], txt, b["html"])
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
                 m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
                 m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
@@ -252,6 +251,13 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                         }
 
             filas_resultado.extend(ofertas_ficha.values())
+
+            if idx == 0:
+                log(f"   [Diagnóstico Ficha 1] P/N: {pn_final} | Filas extraídas: {len(filas_resultado)}")
+                if filas_resultado:
+                    log(f"   [Diagnóstico Ficha 1] Ejemplo oferta 1: {filas_resultado[0]}")
+                if datos_dom["bloques"]:
+                    log(f"   [Diagnóstico Ficha 1] Imgs fila 1: {datos_dom['bloques'][0]['imgs']}")
 
         except Exception as e:
             if idx == 0:
@@ -313,7 +319,6 @@ async def ejecutar_scraping():
 
         page = await context.new_page()
 
-        # FASE 1: Recorrer cada término avanzando con clic real en '>' en el paginador Angular
         for termino in TERMINOS_BUSQUEDA:
             url_inicio = f"https://pistacierto.com/buscador?search={quote(termino)}&size=100"
             try:
@@ -350,7 +355,6 @@ async def ejecutar_scraping():
 
                 log(f"Buscador '{termino}' pág. {pagina_actual}: {len(enlaces)} items | +{nuevos_en_pag} equipos nuevos (Total únicos: {len(productos_encontrados)})")
 
-                # Pulsar botón '>' real de la paginación Angular
                 btn_next = page.locator("button:has-text('>'), a:has-text('>')").last
                 if await btn_next.count() > 0:
                     try:
@@ -380,7 +384,6 @@ async def ejecutar_scraping():
             await browser.close()
             return False
 
-        # FASE 2: Extraer mayoristas y precios reales de cada ficha
         log(f"\n2. Extrayendo mayoristas y precios reales de {len(productos_encontrados)} equipos...")
         sem = asyncio.Semaphore(CONCURRENCIA_FICHAS)
         progreso = {"hechas": 0, "total": len(productos_encontrados)}

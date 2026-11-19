@@ -40,6 +40,24 @@ def extraer_nombre_mayorista(imgs_alt_src):
                 return nombre.upper() if len(nombre) <= 4 else nombre.title()
     return "Mayorista Desconocido"
 
+async def cerrar_popups(page):
+    """Cierra modales SweetAlert2 (swal2) o avisos de cookies que bloqueen la pantalla."""
+    for _ in range(3):
+        try:
+            modal = page.locator(".swal2-container.swal2-backdrop-show")
+            if await modal.count() > 0:
+                btn_ok = page.locator(".swal2-confirm, .swal2-close, .swal2-cancel").first
+                if await btn_ok.count() > 0 and await btn_ok.is_visible():
+                    await btn_ok.click(force=True)
+                else:
+                    await page.keyboard.press("Escape")
+                await page.wait_for_timeout(800)
+            else:
+                break
+        except Exception:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(500)
+
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
     if not sesion_raw:
@@ -100,27 +118,33 @@ async def ejecutar_scraping():
 
         print(f"2. ¡Acceso correcto sin bloqueo de IP! URL: {page.url}")
 
-        # Escribir ASUS en el buscador superior ("P/N, Fabricante, Modelo...") y pulsar Enter o la lupa
-        buscador = page.locator("input[placeholder*='Fabricante']:visible, input[placeholder*='Buscar']:visible, input[type='search']:visible, input[type='text']:visible").first
+        # Cerrar cualquier ventana emergente (SweetAlert2) que tape la pantalla
+        await cerrar_popups(page)
+
+        # Escribir ASUS en el buscador superior (#buscador_doesfinder)
+        buscador = page.locator("#buscador_doesfinder, input[placeholder*='Fabricante']:visible, input[placeholder*='Buscar']:visible").first
         if await buscador.count() > 0:
-            await buscador.click()
+            await buscador.click(force=True)
             await buscador.fill("ASUS")
+            await page.wait_for_timeout(1000)
             await buscador.press("Enter")
             await page.wait_for_timeout(1500)
             btn_lupa = buscador.locator("xpath=following-sibling::button | ../button | ../..//button").first
             if await btn_lupa.count() > 0:
                 try:
-                    await btn_lupa.click()
+                    await btn_lupa.click(force=True)
                 except Exception:
                     pass
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(3000)
 
+        await cerrar_popups(page)
+
         # Marcar filtro lateral de fabricante ASUS si existe
         filtro_asus = page.locator("label:has-text('ASUS'), span:has-text('ASUS'), a:has-text('ASUS')").first
         try:
             if await filtro_asus.is_visible():
-                await filtro_asus.click()
+                await filtro_asus.click(force=True)
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(3000)
         except Exception:
@@ -138,7 +162,7 @@ async def ejecutar_scraping():
                 try:
                     btn = botones_ver.nth(i)
                     if await btn.is_visible():
-                        await btn.click()
+                        await btn.click(force=True)
                         await page.wait_for_timeout(150)
                 except Exception:
                     continue
@@ -278,7 +302,7 @@ async def ejecutar_scraping():
             if await btn_siguiente.count() > 0 and await btn_siguiente.is_enabled():
                 try:
                     antes_count = len(registros)
-                    await btn_siguiente.click()
+                    await btn_siguiente.click(force=True)
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(2500)
                     if len(registros) == antes_count and pagina_actual > 1:

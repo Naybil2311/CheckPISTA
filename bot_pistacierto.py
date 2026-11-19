@@ -5,6 +5,7 @@ import shutil
 import asyncio
 import pandas as pd
 from datetime import datetime
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 
 ARCHIVO_HISTORICO = "tarifa_pistacierto_anterior.csv"
@@ -13,17 +14,42 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
-URL_BUSCADOR = "https://pistacierto.com/buscador?size=100"
+# Búsquedas de gamas de equipos ASUS (recorrerá TODAS las páginas de cada término)
+TERMINOS_BUSQUEDA = [
+    "EXPERTBOOK",
+    "EXPERTCENTER",
+    "ASUSPRO",
+    "90NX",      # Portátiles comerciales (ExpertBook, Chromebook)
+    "90PF",      # Sobremesas (ExpertCenter D/P/M, ProArt)
+    "90PT",      # All-in-One (ExpertCenter E1/E3/E5)
+    "90MS",      # Mini PC (ExpertCenter PN/PB)
+    "90NB",      # Portátiles VivoBook / ExpertBook
+    "90NR"       # Portátiles alto rendimiento
+]
 
-# Cambia a True si quieres incluir también filas de mayoristas "Sin stock" o con precio 0,00€
+# Palabras clave para descartar accesorios, monitores, periféricos y garantías
+EXCLUIR_ACCESORIOS = [
+    "MONITOR", "ZENSCREEN", "PROART PA", "RATON", "RATÓN", "MOUSE",
+    "MOCHILA", "FUNDA", "CARRY BAG", "BACKPACK", "ALFOMBRILLA", "SCABBARD",
+    "GARANTIA", "GARANTÍA", "WARRANTY", "PREMIUM CARE", "EXTENSION", "EXTENSIÓN",
+    "ADAPTADOR", "TECLADO", "KEYBOARD", "AURICULAR", "HEADSET", "WEBCAM",
+    "PROYECTOR", "ROUTER", "EXPERTWIFI", "CONMUTADOR", "SWITCH", "VIVOWATCH",
+    "ZENDRIVE", "GRABADORA", "PLACA BASE", "TARJETA", "CAJA ", "TORRE PEQUEÑA",
+    "FUENTE DE ALIMENTACION", "CARGADOR", "DOCK", "MALETIN", "MALETÍN"
+]
+
+# Cambia a True si quieres incluir también mayoristas sin stock ("Sin stock")
 INCLUIR_SIN_STOCK = False
+CONCURRENCIA_FICHAS = 6
 
 def log(msg):
     print(msg, flush=True)
 
 def limpiar_numero(texto):
-    if not texto:
+    if texto is None:
         return None
+    if isinstance(texto, (int, float)):
+        return float(texto)
     txt = str(texto).replace("€", "").strip()
     if "," in txt and "." in txt:
         txt = txt.replace(".", "").replace(",", ".")
@@ -32,50 +58,76 @@ def limpiar_numero(texto):
     m = re.search(r"\d+(?:\.\d+)?", txt)
     return float(m.group(0)) if m else None
 
-def extraer_nombre_mayorista(imgs_info, texto_fila=""):
-    up = texto_fila.upper()
-    if "PISTACERO" in up or "COMPRA AGRUPADA" in up:
-        return "PISTACERO (Compra Agrupada)"
-    if "TD SYNNEX" in up or "TECH DATA" in up:
-        return "TD SYNNEX"
-    if "IDIOMUND" in up:
-        return "Idiomund"
-    if "DEPAU" in up:
-        return "Depau"
-    if "INFORPOR" in up:
-        return "Inforpor"
-    if "ESPRINET" in up:
-        return "Esprinet"
-    if "VALORISTA" in up:
-        return "Valorista"
-    if "MEGASUR" in up:
-        return "Megasur"
-    if "V-VALLEY" in up or "VVALLEY" in up:
-        return "V-Valley"
-    if "INGRAM" in up:
-        return "Ingram Micro"
-    if "MCR" in up:
-        return "MCR"
-    if "HISPAMICRO" in up:
-        return "Hispamicro"
+def es_equipo_valido(titulo):
+    up = titulo.upper()
+    if any(exc in up for exc in EXCLUIR_ACCESORIOS):
+        return False
+    claves_ok = [
+        "ASUS", "EXPERTBOOK", "EXPERTCENTER", "ASUSPRO", "ZENBOOK",
+        "VIVOBOOK", "CHROMEBOOK", "PORTATIL", "PORTÁTIL", "ORDENADOR",
+        "NOTEBOOK", "AIO", "ALL IN ONE", "MINI PC", "MINIPC",
+        "90NX", "90PF", "90PT", "90MS", "90NB", "90NR"
+    ]
+    return any(c in up for c in claves_ok)
 
-    for alt, title, src in imgs_info:
-        for candidato in [alt, title]:
-            c = (candidato or "").strip()
-            if c and len(c) > 1 and not any(x in c.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon"]):
-                return c
-        if src:
-            archivo = src.split("/")[-1].split("?")[0]
-            nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
-            nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
-            nombre = re.sub(r"[-_]", " ", nombre).strip()
-            if nombre and len(nombre) > 1 and not nombre.isdigit():
-                return nombre.upper() if len(nombre) <= 4 else nombre.title()
+def normalizar_mayorista(raw_name, imgs_info=None, texto_fila=""):
+    combinado = f"{raw_name or ''} {texto_fila or ''}".upper()
+    if imgs_info:
+        for alt, title, src in imgs_info:
+            combinado += f" {alt or ''} {title or ''} {src or ''}".upper()
+
+    mapa = [
+        ("PISTACERO", "PISTACERO (Compra Agrupada)"),
+        ("COMPRA AGRUPADA", "PISTACERO (Compra Agrupada)"),
+        ("IDIOMUN", "Idiomund"),
+        ("GRUPO SII", "Idiomund"),
+        ("TD SYNNEX", "TD SYNNEX"),
+        ("TDSYNNEX", "TD SYNNEX"),
+        ("TECH DATA", "TD SYNNEX"),
+        ("DEPAU", "Depau"),
+        ("INFORPOR", "Inforpor"),
+        ("ESPRINET", "Esprinet"),
+        ("VALORISTA", "Valorista"),
+        ("MEGASUR", "Megasur"),
+        ("V-VALLEY", "V-Valley"),
+        ("VVALLEY", "V-Valley"),
+        ("INGRAM", "Ingram Micro"),
+        ("MCR", "MCR"),
+        ("HISPAMICRO", "Hispamicro"),
+        ("GLOBOMATIK", "Globomatik"),
+        ("BINARY", "Binary"),
+        ("GTI", "GTI"),
+        ("ARROW", "Arrow"),
+        ("DMI", "DMI Computer"),
+        ("UNYKA", "Unyka"),
+        ("PCBOX", "PcBox"),
+        ("TICNOVA", "Ticnova"),
+    ]
+    for clave, nombre_limpio in mapa:
+        if clave in combinado:
+            return nombre_limpio
+
+    if raw_name and str(raw_name).strip() and not str(raw_name).strip().isdigit():
+        return str(raw_name).strip()
+
+    if imgs_info:
+        for alt, title, src in imgs_info:
+            for cand in [alt, title]:
+                c = (cand or "").strip()
+                if c and len(c) > 1 and not any(x in c.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon"]):
+                    return c
+            if src:
+                archivo = src.split("/")[-1].split("?")[0]
+                nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
+                nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
+                nombre = re.sub(r"[-_]", " ", nombre).strip()
+                if nombre and len(nombre) > 1 and not nombre.isdigit():
+                    return nombre
 
     return "Mayorista Desconocido"
 
 async def cerrar_popups(page):
-    for _ in range(3):
+    for _ in range(2):
         try:
             modal = page.locator(".swal2-container.swal2-backdrop-show")
             if await modal.count() > 0:
@@ -91,85 +143,234 @@ async def cerrar_popups(page):
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(200)
 
-async def aplicar_filtro_fabricante_asus(page):
-    """Despliega la barra lateral 'Fabricantes', marca ASUS y verifica 'Filtros aplicados'."""
-    log("Aplicando filtro lateral 'Fabricantes -> ASUS'...")
-    await cerrar_popups(page)
+def extraer_ofertas_de_json_api(data, url_prod, titulo_previo, fecha_ejecucion):
+    """Busca recursivamente listas de ofertas de mayoristas en las respuestas JSON de la API de PistaCierto."""
+    ofertas = []
+    pn_detectado = ""
 
-    # 1. Desplegar el acordeón 'Fabricantes' si estuviera cerrado y pulsar 'Ver más' dentro de Fabricantes
-    await page.evaluate("""() => {
-        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
-            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
-        for (const h of headers) {
-            const sec = h.parentElement;
-            if (sec && !sec.querySelector("input[type='checkbox']")) {
-                h.click();
-            }
-        }
-    }""")
-    await page.wait_for_timeout(800)
+    def buscar_pn(obj):
+        nonlocal pn_detectado
+        if pn_detectado or not isinstance(obj, dict):
+            return
+        for k in ["partNumber", "part_number", "pn", "mpn", "referenciaFabricante", "codigoFabricante"]:
+            val = obj.get(k)
+            if isinstance(val, str) and len(val.strip()) >= 5:
+                pn_detectado = val.strip()
+                return
+        for v in obj.values():
+            if isinstance(v, dict):
+                buscar_pn(v)
 
-    # Pulsar 'Ver más' si está dentro del bloque de Fabricantes
-    await page.evaluate("""() => {
-        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
-            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
-        for (const h of headers) {
-            let box = h.parentElement;
-            for (let i = 0; i < 4 && box; i++) {
-                const verMas = Array.from(box.querySelectorAll("a, button, span, div"))
-                    .find(el => /^Ver más$/i.test((el.innerText || "").trim()));
-                if (verMas) {
-                    verMas.click();
-                    break;
+    buscar_pn(data)
+
+    def recorrer(obj):
+        if isinstance(obj, list) and len(obj) > 0 and all(isinstance(x, dict) for x in obj):
+            # Comprobar si esta lista contiene ofertas de mayoristas (tienen precio y mayorista/proveedor/stock)
+            muestra = obj[0]
+            claves = {k.lower() for k in muestra.keys()}
+            tiene_precio = any(c in claves for c in ["precio", "price", "pvd", "importe", "coste"])
+            tiene_prov = any(c in claves for c in ["mayorista", "proveedor", "wholesaler", "distribuidor", "supplier", "nombre_mayorista", "mayorista_nombre"])
+            if tiene_precio and tiene_prov:
+                for item in obj:
+                    prov_raw = ""
+                    for k in ["mayorista", "proveedor", "wholesaler", "distribuidor", "supplier", "nombre_mayorista", "mayorista_nombre"]:
+                        v = item.get(k)
+                        if isinstance(v, dict):
+                            prov_raw = v.get("nombre") or v.get("name") or v.get("alias") or ""
+                        elif isinstance(v, str) and v.strip():
+                            prov_raw = v.strip()
+                        if prov_raw:
+                            break
+
+                    precio_val = None
+                    for k in ["precio", "price", "pvd", "importe", "precio_final"]:
+                        if k in item and item[k] is not None:
+                            precio_val = limpiar_numero(item[k])
+                            if precio_val is not None:
+                                break
+
+                    canon_val = 0.0
+                    for k in ["canon", "lpi", "importe_canon"]:
+                        if k in item and item[k] is not None:
+                            c_num = limpiar_numero(item[k])
+                            if c_num is not None:
+                                canon_val = c_num
+                                break
+
+                    stock_val = 0
+                    for k in ["stock", "unidades", "cantidad", "disponible", "qty"]:
+                        if k in item and item[k] is not None:
+                            try:
+                                stock_val = int(float(item[k]))
+                                break
+                            except Exception:
+                                pass
+
+                    if precio_val is not None and precio_val > 0:
+                        if stock_val <= 0 and not INCLUIR_SIN_STOCK:
+                            continue
+                        ofertas.append({
+                            "Fecha": fecha_ejecucion,
+                            "P/N": pn_detectado,
+                            "Modelo": titulo_previo,
+                            "Mayorista": normalizar_mayorista(prov_raw),
+                            "Precio (€)": precio_val,
+                            "Canon (€)": canon_val,
+                            "Stock": max(0, stock_val),
+                            "Estado Stock": "Con stock" if stock_val > 0 else "Sin stock",
+                            "URL": url_prod
+                        })
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                recorrer(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                recorrer(v)
+
+    recorrer(data)
+    return ofertas, pn_detectado
+
+async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fecha_ejecucion, progreso):
+    async with sem:
+        page = await context.new_page()
+        filas_resultado = []
+        respuestas_json = []
+
+        async def on_response(response):
+            try:
+                if "pistacero" in response.url or "pistacierto" in response.url:
+                    ct = response.headers.get("content-type", "")
+                    if "application/json" in ct and response.status == 200:
+                        data = await response.json()
+                        respuestas_json.append((response.url, data))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        try:
+            await page.goto(url_prod, wait_until="domcontentloaded", timeout=35000)
+            try:
+                await page.wait_for_selector("text=/€|SKU|canon/i", timeout=7000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            await cerrar_popups(page)
+
+            if INCLUIR_SIN_STOCK:
+                try:
+                    btn_sin = page.locator("text=/Sin stock/i").first
+                    if await btn_sin.count() > 0 and await btn_sin.is_visible():
+                        await btn_sin.click(force=True)
+                        await page.wait_for_timeout(700)
+                except Exception:
+                    pass
+
+            # Extraer P/N, título y estructura DOM de las filas de mayoristas
+            datos_dom = await page.evaluate("""() => {
+                const bodyTxt = document.body.innerText || "";
+                const h1 = document.querySelector("h1, h2, .product-title, .titulo-producto");
+                const titulo = h1 ? (h1.innerText || "").trim() : "";
+
+                let pn = "";
+                const mPn = bodyTxt.match(/P\\/N:\\s*([A-Z0-9\\-\\.]+)/i);
+                if (mPn) pn = mPn[1].trim();
+
+                // Buscar filas de mayoristas dentro de la ficha
+                const filas = [];
+                const candidatos = Array.from(document.querySelectorAll("div, tr, li")).filter(el => {
+                    const t = (el.innerText || "").trim();
+                    const tienePrecio = /\\d[\\d\\.]*,\\d{2}\\s*€/.test(t);
+                    const esFilaOferta = /(u\\.|canon|Sin stock|SKU|PISTACERO)/i.test(t);
+                    return tienePrecio && esFilaOferta && t.length < 380;
+                });
+
+                const vistas = new Set();
+                for (const el of candidatos) {
+                    const t = (el.innerText || "").trim();
+                    if (vistas.has(t)) continue;
+                    const hijos = Array.from(el.querySelectorAll("div, tr, li")).filter(h => {
+                        const ht = (h.innerText || "").trim();
+                        return /\\d[\\d\\.]*,\\d{2}\\s*€/.test(ht) && /(u\\.|canon|Sin stock|SKU|PISTACERO)/i.test(ht) && ht.length < 380;
+                    });
+                    if (hijos.length > 0) continue;
+
+                    vistas.add(t);
+                    const imgs = Array.from(el.querySelectorAll("img")).map(img => [
+                        img.alt || "",
+                        img.title || "",
+                        img.src || ""
+                    ]);
+                    filas.push({ texto: t, imgs: imgs, html: el.outerHTML.slice(0, 450) });
                 }
-                box = box.parentElement;
-            }
-        }
-    }""")
-    await page.wait_for_timeout(1200)
 
-    # 2. Localizar específicamente la sección 'Fabricantes' y marcar el checkbox de 'ASUS'
-    marcado = await page.evaluate("""() => {
-        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
-            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
+                return { titulo: titulo, pn: pn, filas: filas };
+            }""")
 
-        for (const h of headers) {
-            let box = h.parentElement;
-            for (let i = 0; i < 4 && box; i++) {
-                const items = Array.from(box.querySelectorAll("label, li, div"));
-                for (const item of items) {
-                    const txt = (item.innerText || "").trim();
-                    if (/^ASUS(\\s*\\d+|\\s*\\(\\d+\\))?$/i.test(txt)) {
-                        const chk = item.querySelector("input[type='checkbox']") ||
-                                    (item.parentElement ? item.parentElement.querySelector("input[type='checkbox']") : null);
-                        if (chk) {
-                            if (!chk.checked) chk.click();
-                            return true;
-                        }
-                        item.click();
-                        return true;
-                    }
-                }
-                box = box.parentElement;
-            }
-        }
-        return false;
-    }""")
+            titulo_final = datos_dom["titulo"] or titulo_previo
+            pn_final = datos_dom["pn"]
+            if not pn_final:
+                m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{4,10}-[A-Z0-9]{4,10})\b", titulo_final)
+                pn_final = m_pn_tit.group(1) if m_pn_tit else titulo_final[:35]
 
-    await page.wait_for_timeout(3000)
+            # 1. Intentar extraer directamente del JSON interceptado de la API
+            for _, jdata in respuestas_json:
+                ofertas_api, pn_api = extraer_ofertas_de_json_api(jdata, url_prod, titulo_final, fecha_ejecucion)
+                if ofertas_api:
+                    for of in ofertas_api:
+                        if not of["P/N"]:
+                            of["P/N"] = pn_final
+                    filas_resultado.extend(ofertas_api)
 
-    # Verificar que realmente se aplicó el filtro mirando el primer producto
-    primer_prod = await page.evaluate("""() => {
-        const a = document.querySelector("a[href*='/productos/detalle/']");
-        return a ? (a.innerText || "").trim() : "";
-    }""")
-    log(f"   Checkbox ASUS marcado: {marcado} | Primer producto visible: '{primer_prod[:60]}'")
+            # 2. Si la API no devolvió la lista en formato estándar, extraer del DOM de la ficha
+            if not filas_resultado:
+                for fila in datos_dom["filas"]:
+                    txt = fila["texto"]
+                    mayorista = normalizar_mayorista("", fila["imgs"], txt)
 
-    # Respaldo: si no se aplicó el filtro lateral, usar la URL de búsqueda con fabricante ASUS
-    if not marcado or ("ASUS" not in primer_prod.upper() and "EXPERT" not in primer_prod.upper()):
-        log("   Usando URL directa filtrada por ASUS como respaldo...")
-        await page.goto("https://pistacierto.com/buscador?search=ASUS&size=100", wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(3000)
+                    precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt)
+                    m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
+                    m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
+
+                    precio = limpiar_numero(precios[0]) if precios else None
+                    canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
+                    stock = int(m_stock.group(1)) if m_stock else 0
+                    sin_stock = "sin stock" in txt.lower() or precio == 0.0 or (stock == 0 and "u." in txt.lower())
+
+                    if sin_stock and not INCLUIR_SIN_STOCK:
+                        continue
+
+                    if precio is not None:
+                        filas_resultado.append({
+                            "Fecha": fecha_ejecucion,
+                            "P/N": pn_final,
+                            "Modelo": titulo_final,
+                            "Mayorista": mayorista,
+                            "Precio (€)": precio,
+                            "Canon (€)": canon,
+                            "Stock": 0 if sin_stock else stock,
+                            "Estado Stock": "Sin stock" if sin_stock else ("Con stock" if stock > 0 else "Consultar"),
+                            "URL": url_prod
+                        })
+
+            if idx == 0:
+                log(f"   [Diagnóstico Ficha 1] URL: {url_prod} | P/N: {pn_final}")
+                log(f"   [Diagnóstico Ficha 1] JSONs API capturados: {len(respuestas_json)} | Ofertas extraídas: {len(filas_resultado)}")
+                if filas_resultado:
+                    log(f"   [Diagnóstico Ficha 1] Muestra fila: {filas_resultado[0]}")
+                elif datos_dom["filas"]:
+                    log(f"   [Diagnóstico Ficha 1] HTML fila DOM: {datos_dom['filas'][0]['html']}")
+
+        except Exception as e:
+            if idx == 0:
+                log(f"   [Diagnóstico Ficha 1] Error: {e}")
+        finally:
+            await page.close()
+            progreso["hechas"] += 1
+            if progreso["hechas"] % 30 == 0 or progreso["hechas"] == progreso["total"]:
+                log(f"   Progreso fichas: {progreso['hechas']}/{progreso['total']} analizadas...")
+
+        return filas_resultado
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
@@ -183,10 +384,8 @@ async def ejecutar_scraping():
         log(f"Error al leer PC_SESSION (formato JSON inválido): {e}")
         return False
 
-    registros = []
-    urls_procesadas = set()
-    diagnostico_hecho = False
     fecha_ejecucion = datetime.now().strftime("%Y-%m-%d %H:%M")
+    productos_encontrados = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -222,204 +421,83 @@ async def ejecutar_scraping():
 
         page = await context.new_page()
 
-        log(f"1. Abriendo catálogo en {URL_BUSCADOR}...")
-        await page.goto(URL_BUSCADOR, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(3000)
+        # FASE 1: Recorrer TODAS las páginas de cada término sin detenerse en la página 1
+        for termino in TERMINOS_BUSQUEDA:
+            pagina_actual = 1
+            while pagina_actual <= 30:
+                url_pagina = f"https://pistacierto.com/buscador?search={quote(termino)}&page={pagina_actual}&size=100&order=1"
+                cargada = False
+                for _ in range(3):
+                    try:
+                        await page.goto(url_pagina, wait_until="domcontentloaded", timeout=35000)
+                        await page.wait_for_timeout(2000)
+                        cargada = True
+                        break
+                    except Exception:
+                        await page.wait_for_timeout(1000)
 
-        if "/login" in page.url:
-            log("❌ La sesión guardada en PC_SESSION ha caducado.")
+                if not cargada:
+                    break
+
+                if "/login" in page.url:
+                    log("❌ La sesión guardada en PC_SESSION ha caducado.")
+                    await browser.close()
+                    return False
+
+                await cerrar_popups(page)
+
+                enlaces = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"))
+                        .map(a => ({ url: a.href.split('?')[0], titulo: (a.innerText || '').trim() }))
+                        .filter(x => x.titulo.length > 4);
+                }""")
+
+                # Solo detenerse cuando la página ya no devuelve ningún producto
+                if not enlaces:
+                    break
+
+                nuevos_en_esta_pag = 0
+                descartados_accesorios = 0
+                for item in enlaces:
+                    if not es_equipo_valido(item["titulo"]):
+                        descartados_accesorios += 1
+                        continue
+                    if item["url"] not in productos_encontrados:
+                        productos_encontrados[item["url"]] = item["titulo"]
+                        nuevos_en_esta_pag += 1
+
+                log(f"Buscador '{termino}' pág. {pagina_actual}: {len(enlaces)} items | +{nuevos_en_esta_pag} equipos nuevos (Total únicos: {len(productos_encontrados)})")
+
+                # Si toda la página estaba repetida (el servidor repitió la última página), pasar al siguiente término
+                if nuevos_en_esta_pag == 0 and descartados_accesorios == 0:
+                    break
+
+                pagina_actual += 1
+
+        await page.close()
+
+        if not productos_encontrados:
+            log("No se encontraron equipos ASUS.")
             await browser.close()
             return False
 
-        await aplicar_filtro_fabricante_asus(page)
+        # FASE 2: Extraer mayoristas, precios y stock reales de cada ficha
+        log(f"\n2. Extrayendo mayoristas y precios reales de {len(productos_encontrados)} equipos...")
+        sem = asyncio.Semaphore(CONCURRENCIA_FICHAS)
+        progreso = {"hechas": 0, "total": len(productos_encontrados)}
 
-        pagina_actual = 1
-        while True:
-            await cerrar_popups(page)
-            await page.wait_for_timeout(1500)
+        tareas = [
+            extraer_ficha_producto(context, sem, i, url, tit, fecha_ejecucion, progreso)
+            for i, (url, tit) in enumerate(productos_encontrados.items())
+        ]
 
-            botones_mostrar = page.locator("text=/Mostrar mayoristas|Ver mayoristas/i")
-            total_botones = await botones_mostrar.count()
-            log(f"2. Página {pagina_actual}: desplegando {total_botones} botones 'Mostrar mayoristas'...")
-
-            for i in range(total_botones):
-                try:
-                    btn = botones_mostrar.nth(i)
-                    if await btn.is_visible():
-                        await btn.click(force=True)
-                        await page.wait_for_timeout(60)
-                except Exception:
-                    continue
-
-            if total_botones > 0:
-                await page.wait_for_timeout(2500)
-
-            tarjetas_pagina = await page.evaluate("""() => {
-                const resultados = [];
-                const enlaces = Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"));
-                const vistas = new Set();
-
-                for (const enlace of enlaces) {
-                    const titulo = (enlace.innerText || "").trim();
-                    if (!titulo || titulo.length < 5) continue;
-                    const urlProd = enlace.href.split("?")[0];
-
-                    // Subir hasta el contenedor completo de la fila de producto (incluye tarjeta + panel desplegado inferior)
-                    let cont = enlace.parentElement;
-                    let mejorCont = null;
-                    for (let nivel = 0; nivel < 12 && cont; nivel++) {
-                        const enlacesEnCont = cont.querySelectorAll("a[href*='/productos/detalle/']").length;
-                        if (enlacesEnCont > 2) break;
-                        const txt = cont.innerText || "";
-                        if (txt.includes("Ocultar mayoristas") || txt.includes("Mostrar mayoristas") || txt.includes("STOCK:")) {
-                            mejorCont = cont;
-                        }
-                        cont = cont.parentElement;
-                    }
-
-                    if (!mejorCont || vistas.has(mejorCont)) continue;
-                    vistas.add(mejorCont);
-
-                    // Si el panel de mayoristas desplegado está como hermano siguiente de mejorCont, incluirlo también
-                    let textoCompleto = mejorCont.innerText || "";
-                    let contenedorBusqueda = mejorCont;
-                    const sig = mejorCont.nextElementSibling;
-                    if (sig && !sig.querySelector("a[href*='/productos/detalle/']") && /\\d[\\d\\.]*,\\d{2}/.test(sig.innerText || "")) {
-                        textoCompleto += "\\n" + (sig.innerText || "");
-                        contenedorBusqueda = mejorCont.parentElement || mejorCont;
-                    }
-
-                    // Buscar filas desplegadas de mayoristas (NO exigir el símbolo € porque el CSS lo separa)
-                    const filasMayoristas = [];
-                    const candidatos = Array.from(contenedorBusqueda.querySelectorAll("div, tr, li")).filter(el => {
-                        if (contenedorBusqueda !== mejorCont && !mejorCont.contains(el) && !(sig && sig.contains(el))) return false;
-                        const t = (el.innerText || "").trim();
-                        const tienePrecio = /\\d[\\d\\.]*,\\d{2}/.test(t);
-                        const esFilaDesplegada = /(u\\.|canon|Sin stock|PISTACERO|IDIOMUND|DEPAU|INFORPOR|ESPRINET|SYNNEX|MCR|VALORISTA|MEGASUR|HISPAMICRO)/i.test(t);
-                        const esCuadroSuperior = /STOCK:\\s*\\d+/i.test(t) && !/canon/i.test(t) && !/\\(\\d+\\s*u\\.\\)/i.test(t);
-                        return tienePrecio && esFilaDesplegada && !esCuadroSuperior && t.length < 320;
-                    });
-
-                    const filasVistas = new Set();
-                    for (const fila of candidatos) {
-                        const t = (fila.innerText || "").trim();
-                        if (filasVistas.has(t)) continue;
-
-                        const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
-                            const st = (s.innerText || "").trim();
-                            return /\\d[\\d\\.]*,\\d{2}/.test(st) && /(u\\.|canon|Sin stock|PISTACERO|IDIOMUND|DEPAU|INFORPOR|ESPRINET|SYNNEX|MCR|VALORISTA|MEGASUR|HISPAMICRO)/i.test(st) && st.length < 320;
-                        });
-                        if (sub.length > 0) continue;
-
-                        filasVistas.add(t);
-                        const imgs = Array.from(fila.querySelectorAll("img")).map(img => [
-                            img.alt || "",
-                            img.title || "",
-                            img.src || ""
-                        ]);
-                        filasMayoristas.push({ texto: t, imgs: imgs });
-                    }
-
-                    resultados.push({
-                        titulo: titulo,
-                        url: urlProd,
-                        textoTarjeta: textoCompleto,
-                        mayoristas: filasMayoristas
-                    });
-                }
-                return resultados;
-            }""")
-
-            if not diagnostico_hecho and tarjetas_pagina:
-                diagnostico_hecho = True
-                t0 = tarjetas_pagina[0]
-                log(f"   [Diagnóstico Tarjeta 1] Texto desplegado: {t0['textoTarjeta'][:420].replace(chr(10), ' | ')}")
-                log(f"   [Diagnóstico Tarjeta 1] Filas mayoristas detectadas ({len(t0['mayoristas'])}): {t0['mayoristas']}")
-
-            if not tarjetas_pagina:
-                break
-
-            nuevos_reg = 0
-            for prod in tarjetas_pagina:
-                url_prod = prod["url"]
-                if url_prod in urls_procesadas:
-                    continue
-                urls_procesadas.add(url_prod)
-
-                txt_card = prod["textoTarjeta"]
-
-                # Extraer P/N de la etiqueta bajo el título
-                pn = ""
-                for linea in [l.strip() for l in txt_card.split("\n") if l.strip()]:
-                    if linea.lower() in ["asus", "mostrar mayoristas", "ocultar mayoristas", "añadir", "comparar", "sin stock"]:
-                        continue
-                    if re.match(r"^[A-Z0-9]{4,10}-[A-Z0-9]{4,10}$", linea, re.I):
-                        pn = linea
-                        break
-                if not pn:
-                    m_pn = re.search(r"\b([A-Z0-9]{4,10}-[A-Z0-9]{4,10})\b", prod["titulo"], re.I)
-                    pn = m_pn.group(1) if m_pn else prod["titulo"][:35]
-
-                for m in prod["mayoristas"]:
-                    txt_m = m["texto"]
-                    mayorista = extraer_nombre_mayorista(m["imgs"], txt_m)
-
-                    precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt_m)
-                    m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt_m, re.I)
-                    m_stock = re.search(r"(\d+)\s*u\.", txt_m, re.I)
-
-                    precio = limpiar_numero(precios[0]) if precios else None
-                    canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
-                    stock = int(m_stock.group(1)) if m_stock else 0
-                    sin_stock = "sin stock" in txt_m.lower() or precio == 0.0 or stock == 0
-
-                    if sin_stock and not INCLUIR_SIN_STOCK:
-                        continue
-
-                    if precio is not None:
-                        registros.append({
-                            "Fecha": fecha_ejecucion,
-                            "P/N": pn,
-                            "Modelo": prod["titulo"],
-                            "Mayorista": mayorista,
-                            "Precio (€)": precio,
-                            "Canon (€)": canon,
-                            "Stock": 0 if sin_stock else stock,
-                            "Estado Stock": "Sin stock" if sin_stock else "Con stock",
-                            "URL": url_prod
-                        })
-                        nuevos_reg += 1
-
-            log(f"   Página {pagina_actual}: {len(tarjetas_pagina)} productos | +{nuevos_reg} ofertas mayoristas | Total acumulado: {len(registros)}")
-
-            # Avanzar a la siguiente página pulsando el botón '>' de la paginación
-            btn_next = page.locator("a:has-text('>'), button:has-text('>'), li.page-item:not(.disabled) a[rel='next'], a[aria-label*='Next']").last
-            if await btn_next.count() > 0:
-                try:
-                    clase_padre = await btn_next.evaluate("el => el.parentElement ? el.parentElement.className : ''")
-                    if "disabled" in (clase_padre or "").lower():
-                        break
-                    url_antes = page.url
-                    titulo_antes = tarjetas_pagina[0]["titulo"]
-                    await btn_next.click(force=True)
-                    await page.wait_for_timeout(3000)
-
-                    primer_titulo_nuevo = await page.evaluate("""() => {
-                        const a = document.querySelector("a[href*='/productos/detalle/']");
-                        return a ? (a.innerText || "").trim() : "";
-                    }""")
-                    if not primer_titulo_nuevo or (primer_titulo_nuevo == titulo_antes and page.url == url_antes):
-                        break
-                    pagina_actual += 1
-                except Exception:
-                    break
-            else:
-                break
+        resultados_por_ficha = await asyncio.gather(*tareas)
+        registros = [fila for sublista in resultados_por_ficha for fila in sublista]
 
         await browser.close()
 
     if not registros:
-        log("No se extrajeron ofertas desplegadas de mayoristas.")
+        log("No se extrajeron ofertas de mayoristas.")
         return False
 
     df = pd.DataFrame(registros).drop_duplicates(subset=["P/N", "Mayorista"])
@@ -437,7 +515,7 @@ async def ejecutar_scraping():
         df_acum = df.copy()
     df_acum.to_csv(ARCHIVO_ACUMULADO, index=False, sep=";", encoding="utf-8-sig")
 
-    log(f"\n✅ Completado: {len(df)} filas reales (P/N x Mayorista con precio y stock) guardadas en {ruta_hist}")
+    log(f"\n✅ Completado: {len(df)} filas reales (Equipo x Mayorista) guardadas en {ruta_hist}")
     return True
 
 def comparar_tarifas():

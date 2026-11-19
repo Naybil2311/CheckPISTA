@@ -14,7 +14,7 @@ ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
 URL_BASE = "https://pistacierto.com"
-URL_CATALOGO = "https://pistacierto.com/productos"
+URL_CATALOGO = "https://pistacierto.com/inicio"
 
 def limpiar_numero(texto):
     if not texto:
@@ -89,7 +89,7 @@ async def ejecutar_scraping():
 
         page = await context.new_page()
 
-        print(f"1. Entrando directamente al catálogo con sesión inyectada ({URL_CATALOGO})...")
+        print(f"1. Entrando directamente al portal con sesión inyectada ({URL_CATALOGO})...")
         await page.goto(URL_CATALOGO, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(3000)
 

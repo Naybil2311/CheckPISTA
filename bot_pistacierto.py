@@ -58,32 +58,58 @@ async def ejecutar_scraping():
 
         print(f"1. Accediendo a {URL_LOGIN} para iniciar sesión...")
         await page.goto(URL_LOGIN, wait_until="networkidle", timeout=60000)
-        await page.wait_for_selector("input[type='password']", timeout=20000)
+        await page.wait_for_selector("input[type='password']:visible", timeout=20000)
 
-        inputs_texto = page.locator("input[type='email'], input[type='text']")
-        inputs_pass = page.locator("input[type='password']")
+        # Cerrar banner de cookies si bloquea la pantalla
+        try:
+            btn_cookies = page.locator("button:has-text('Aceptar'), button:has-text('Entendido'), button:has-text('Accept')").first
+            if await btn_cookies.is_visible():
+                await btn_cookies.click()
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
 
-        await inputs_texto.first.fill(usuario)
-        await inputs_pass.first.fill(password)
+        # Seleccionar solo inputs visibles (evitando buscadores ocultos)
+        input_pass = page.locator("input[type='password']:visible").first
+        # Buscar el campo de usuario/email visible justo antes del campo contraseña o dentro del mismo form
+        form_padre = input_pass.locator("xpath=ancestor::form")
+        if await form_padre.count() > 0:
+            input_user = form_padre.locator("input:not([type='password']):not([type='hidden']):not([type='checkbox']):visible").first
+        else:
+            input_user = page.locator("input[type='email']:visible, input[type='text']:visible").first
 
-        # Hacer clic en el botón de iniciar sesión si existe, o pulsar Enter
-        btn_submit = page.locator("button[type='submit'], button:has-text('Iniciar'), button:has-text('Entrar'), button:has-text('Acceder')").first
+        await input_user.click()
+        await input_user.press_sequentially(usuario, delay=40)
+        await page.wait_for_timeout(300)
+
+        await input_pass.click()
+        await input_pass.press_sequentially(password, delay=40)
+        await page.wait_for_timeout(500)
+
+        # Pulsar el botón de envío dentro del formulario
+        if await form_padre.count() > 0:
+            btn_submit = form_padre.locator("button[type='submit'], button").first
+        else:
+            btn_submit = page.locator("button[type='submit']:visible, button:has-text('Iniciar'):visible, button:has-text('Acceder'):visible, button:has-text('Entrar'):visible").first
+
         if await btn_submit.count() > 0:
             await btn_submit.click()
         else:
-            await inputs_pass.first.press("Enter")
+            await input_pass.press("Enter")
 
-        # Esperar a que la URL deje de ser /login
+        # Esperar redirección fuera de /login
         try:
             await page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
         except Exception:
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
 
         await page.wait_for_load_state("networkidle")
-        print(f"2. Sesión iniciada correctamente. URL actual: {page.url}")
+        print(f"2. URL tras login: {page.url}")
 
         if "/login" in page.url:
-            print("Error: Sigue en /login. Verifica que PC_USER y PC_PASS sean correctos.")
+            texto_visible = await page.inner_text("body")
+            lineas_error = [l.strip() for l in texto_visible.split("\n") if l.strip()][:15]
+            print(f"Error: Sigue en /login. Texto en pantalla: {lineas_error}")
             await browser.close()
             return False
 
@@ -91,7 +117,7 @@ async def ejecutar_scraping():
         await page.goto(URL_CATALOGO, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(2000)
 
-        buscador = page.locator("input[placeholder*='Buscar'], input[type='search'], input[name*='search']").first
+        buscador = page.locator("input[placeholder*='Buscar']:visible, input[type='search']:visible, input[name*='search']:visible").first
         if await buscador.count() > 0:
             await buscador.fill("ASUS")
             await buscador.press("Enter")
@@ -113,7 +139,6 @@ async def ejecutar_scraping():
             await page.wait_for_timeout(1500)
             print(f"3. Procesando página {pagina_actual} del catálogo (URL: {page.url})...")
 
-            # Pulsar todos los botones "Ver mayoristas" cerrados en la página actual
             botones_ver = page.locator("text=/Ver mayoristas/i")
             total_botones = await botones_ver.count()
             for i in range(total_botones):
@@ -128,7 +153,6 @@ async def ejecutar_scraping():
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(1500)
 
-            # Extraer tarjetas con reintento si ocurre una navegación intermedia
             productos_pagina = []
             for intento in range(3):
                 try:
@@ -198,7 +222,7 @@ async def ejecutar_scraping():
                         return tarjetas;
                     }""")
                     break
-                except Exception as e:
+                except Exception:
                     print(f"   Reintentando lectura tras navegación interna ({intento + 1}/3)...")
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(2000)

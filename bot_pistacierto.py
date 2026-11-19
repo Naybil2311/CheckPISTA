@@ -107,7 +107,6 @@ async def ejecutar_scraping():
             await buscador.fill("ASUS")
             await buscador.press("Enter")
             await page.wait_for_timeout(1500)
-            # Intentar pulsar el botón de la lupa si sigue en la misma vista
             btn_lupa = buscador.locator("xpath=following-sibling::button | ../button | ../..//button").first
             if await btn_lupa.count() > 0:
                 try:
@@ -133,7 +132,6 @@ async def ejecutar_scraping():
             await page.wait_for_timeout(2000)
             print(f"3. Procesando página {pagina_actual} (URL: {page.url})...")
 
-            # Desplegar todos los botones de mayoristas / sin stock
             botones_ver = page.locator("text=/Ver mayoristas|Sin stock/i")
             total_botones = await botones_ver.count()
             for i in range(total_botones):
@@ -148,14 +146,13 @@ async def ejecutar_scraping():
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(1500)
 
-            # Diagnóstico de lo que hay en pantalla si es la página 1
             if pagina_actual == 1:
                 info_dom = await page.evaluate("""() => {
                     const enlaces = document.querySelectorAll("a[href*='/productos/detalle/']").length;
-                    const textos = Array.from(document.querySelectorAll("body *"))
-                        .filter(el => el.offsetParent !== null && el.children.length === 0 && el.innerText.trim().length > 3)
-                        .map(el => el.innerText.trim())
-                        .slice(0, 35);
+                    const textos = Array.from(document.querySelectorAll("div, span, p, a, li, td, h1, h2, h3, h4, h5, button"))
+                        .filter(el => el.offsetParent !== null && el.children.length === 0 && (el.innerText || "").trim().length > 3)
+                        .map(el => (el.innerText || "").trim())
+                        .slice(0, 40);
                     return { enlacesDetalle: enlaces, muestraTextos: textos };
                 }""")
                 print(f"   Diagnóstico DOM: {info_dom['enlacesDetalle']} enlaces de detalle | Muestra textos: {info_dom['muestraTextos']}")
@@ -172,13 +169,11 @@ async def ejecutar_scraping():
                             const titulo = (enlace.innerText || "").trim();
                             if (!titulo || titulo.length < 5) continue;
 
-                            // Subir hasta el contenedor de tarjeta que incluye precio en €
                             let cont = enlace.parentElement;
                             let mejorCont = null;
                             for (let nivel = 0; nivel < 8 && cont; nivel++) {
                                 const txt = cont.innerText || "";
                                 const enlacesEnCont = cont.querySelectorAll("a[href*='/productos/detalle/']").length;
-                                // Asegurar que no subimos tanto que englobemos varias tarjetas distintas
                                 if (enlacesEnCont > 2) break;
                                 if (txt.includes("€")) {
                                     mejorCont = cont;
@@ -211,7 +206,7 @@ async def ejecutar_scraping():
 
                             const filasVistas = new Set();
                             for (const fila of candidatos) {
-                                const t = fila.innerText.trim();
+                                const t = (fila.innerText || "").trim();
                                 if (filasVistas.has(t)) continue;
                                 const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
                                     const st = s.innerText || "";

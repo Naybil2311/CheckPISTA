@@ -14,6 +14,9 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
+ARCHIVO_PVD = "pvd_oficial.xlsx"
+ARCHIVO_BAJO_PVD = "alertas_bajo_pvdr.xlsx"
+
 TERMINOS_BUSQUEDA = [
     "EXPERTBOOK",
     "EXPERTCENTER",
@@ -72,6 +75,31 @@ def limpiar_numero(texto):
         txt = txt.replace(",", ".")
     m = re.search(r"\d+(?:\.\d+)?", txt)
     return float(m.group(0)) if m else None
+
+
+def precio_oficial_valido(valor):
+    if valor is None:
+        return None
+    if isinstance(valor, str):
+        s = valor.strip().lower()
+        if not s or any(
+            marca in s
+            for marca in [
+                "no en pricelist",
+                "pricelist",
+                "sin precio",
+                "no disponible",
+                "pendiente",
+                "n/a",
+                "tbd",
+                "-",
+            ]
+        ):
+            return None
+    num = limpiar_numero(valor)
+    if num is None or num <= 0:
+        return None
+    return num
 
 
 def es_equipo_valido(titulo):
@@ -463,11 +491,107 @@ async def ejecutar_scraping():
     return True
 
 
+def contrastar_con_pvdr(df_ofertas, ruta_pvd=ARCHIVO_PVD):
+    if os.path.exists(ARCHIVO_BAJO_PVD):
+        os.remove(ARCHIVO_BAJO_PVD)
+
+    if not os.path.exists(ruta_pvd):
+        log(f"Aviso: No se encontró {ruta_pvd}, se omite el contraste contra referencia.")
+        return
+
+    if ruta_pvd.lower().endswith(".csv"):
+        df_pvd = pd.read_csv(ruta_pvd, sep=None, engine="python")
+    else:
+        xls = pd.ExcelFile(ruta_pvd)
+        df_pvd = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+
+    df_pvd.columns = [str(c).strip() for c in df_pvd.columns]
+
+    col_pn = next((c for c in df_pvd.columns if c.lower() in ["pn", "p/n", "part number"]), None)
+    col_model = next((c for c in df_pvd.columns if c.lower() in ["sales model name", "sales_model_name", "modelo", "model"]), None)
+    col_pvdr = next((c for c in df_pvd.columns if c.lower() in ["pvdr", "pvd"]), None)
+    col_promo = next((c for c in df_pvd.columns if c.lower() in ["pvd promo", "pvd_promo", "promo"]), None)
+
+    if not col_pvdr and not col_promo:
+        log("Error en contraste: no se encontraron columnas 'PvD Promo' ni 'PVDR'.")
+        return
+
+    pvdr_series = df_pvd[col_pvdr].apply(precio_oficial_valido) if col_pvdr else pd.Series([None] * len(df_pvd))
+    promo_series = df_pvd[col_promo].apply(precio_oficial_valido) if col_promo else pd.Series([None] * len(df_pvd))
+
+    df_pvd["PVDR_num"] = pvdr_series
+    df_pvd["PvD_Promo_num"] = promo_series
+
+    # Prioridad: PvD Promo válido (> 0), si no PVDR válido (> 0). Ignora filas sin precio ("No en pricelist", etc.)
+    df_pvd["Ref_Precio_num"] = df_pvd["PvD_Promo_num"].where(
+        df_pvd["PvD_Promo_num"].notna(),
+        df_pvd["PVDR_num"]
+    )
+    df_pvd["Tipo_Ref"] = df_pvd["PvD_Promo_num"].apply(
+        lambda x: "PvD Promo" if pd.notna(x) else "PVDR"
+    )
+
+    df_pvd_validos = df_pvd.dropna(subset=["Ref_Precio_num"]).copy()
+    if df_pvd_validos.empty:
+        log("Aviso: No hay referencias con precio válido en la tarifa oficial tras filtrar 'No en pricelist'.")
+        return
+
+    ofertas_prep = df_ofertas.copy()
+    ofertas_prep["clave_cod"] = ofertas_prep["P/N"].astype(str).str.strip().str.upper()
+
+    cruce_total = pd.DataFrame()
+
+    if col_pn:
+        pvd_pn = df_pvd_validos.copy()
+        pvd_pn["clave_cod"] = pvd_pn[col_pn].astype(str).str.strip().str.upper()
+        pvd_pn = pvd_pn[pvd_pn["clave_cod"] != ""].drop_duplicates(subset=["clave_cod"], keep="first")
+        m1 = pd.merge(ofertas_prep, pvd_pn, on="clave_cod", how="inner")
+        cruce_total = pd.concat([cruce_total, m1], ignore_index=True)
+
+    if col_model:
+        pvd_mod = df_pvd_validos.copy()
+        pvd_mod["clave_cod"] = pvd_mod[col_model].astype(str).str.strip().str.upper()
+        pvd_mod = pvd_mod[pvd_mod["clave_cod"] != ""].drop_duplicates(subset=["clave_cod"], keep="first")
+        m2 = pd.merge(ofertas_prep, pvd_mod, on="clave_cod", how="inner")
+        cruce_total = pd.concat([cruce_total, m2], ignore_index=True)
+
+    if cruce_total.empty:
+        log("Aviso: No hubo coincidencias con referencias vigentes en la tarifa oficial.")
+        return
+
+    cruce_total = cruce_total.drop_duplicates(subset=["P/N", "Mayorista", "Precio (€)", "Stock"])
+
+    cruce_total["Dif vs Ref (€)"] = (cruce_total["Precio (€)"] - cruce_total["Ref_Precio_num"]).round(2)
+    cruce_total["Desv Ref (%)"] = (
+        (cruce_total["Dif vs Ref (€)"] / cruce_total["Ref_Precio_num"]) * 100
+    ).round(2)
+
+    bajo_ref = cruce_total[cruce_total["Dif vs Ref (€)"] <= -0.01].copy()
+    bajo_ref = bajo_ref.sort_values(by="Dif vs Ref (€)", ascending=True)
+
+    if not bajo_ref.empty:
+        cols_orden = [
+            "P/N", col_pn, col_model, "Modelo", "Mayorista",
+            "Precio (€)", "Canon (€)", "Tipo_Ref", "Ref_Precio_num",
+            "PvD_Promo_num", "PVDR_num",
+            "Dif vs Ref (€)", "Desv Ref (%)",
+            "Stock", "Estado Stock", "Fecha", "URL"
+        ]
+        cols_finales = [c for i, c in enumerate(cols_orden) if c and c in bajo_ref.columns and c not in cols_orden[:i]]
+        bajo_ref[cols_finales].to_excel(ARCHIVO_BAJO_PVD, index=False)
+        log(f"⚠️ Detectadas {len(bajo_ref)} ofertas por debajo de la referencia (PvD Promo / PVDR) en {ARCHIVO_BAJO_PVD}.")
+    else:
+        log("✅ Ninguna oferta detectada por debajo de la referencia (PvD Promo / PVDR).")
+
+
 def comparar_tarifas():
     if os.path.exists(ARCHIVO_CAMBIOS):
         os.remove(ARCHIVO_CAMBIOS)
 
     df_nuevo = pd.read_csv(ARCHIVO_NUEVO, sep=";", encoding="utf-8-sig")
+
+    # Contrastar siempre contra la tarifa oficial (priorizando PvD Promo)
+    contrastar_con_pvdr(df_nuevo)
 
     if not os.path.exists(ARCHIVO_HISTORICO):
         os.replace(ARCHIVO_NUEVO, ARCHIVO_HISTORICO)

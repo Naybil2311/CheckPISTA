@@ -92,44 +92,84 @@ async def cerrar_popups(page):
             await page.wait_for_timeout(200)
 
 async def aplicar_filtro_fabricante_asus(page):
-    """Marca la casilla 'ASUS' dentro de la sección lateral 'Fabricantes' igual que en el navegador."""
+    """Despliega la barra lateral 'Fabricantes', marca ASUS y verifica 'Filtros aplicados'."""
     log("Aplicando filtro lateral 'Fabricantes -> ASUS'...")
     await cerrar_popups(page)
 
-    # Si 'Fabricantes' está colapsado o tiene 'Ver más', desplegarlo
-    try:
-        sec_fab = page.locator("text=/^Fabricantes$/i").first
-        if await sec_fab.count() > 0:
-            await sec_fab.scroll_into_view_if_needed()
-    except Exception:
-        pass
+    # 1. Desplegar el acordeón 'Fabricantes' si estuviera cerrado y pulsar 'Ver más' dentro de Fabricantes
+    await page.evaluate("""() => {
+        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
+            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
+        for (const h of headers) {
+            const sec = h.parentElement;
+            if (sec && !sec.querySelector("input[type='checkbox']")) {
+                h.click();
+            }
+        }
+    }""")
+    await page.wait_for_timeout(800)
 
-    # Buscar el checkbox o etiqueta exacta 'ASUS' dentro del bloque de Fabricantes
-    aplicado = await page.evaluate("""() => {
-        const labels = Array.from(document.querySelectorAll("label, span, a, div"));
-        for (const el of labels) {
-            const txt = (el.innerText || "").trim();
-            if (/^ASUS(\\s*\\(\\d+\\))?$/i.test(txt)) {
-                // Verificar que no sea la etiqueta amarilla dentro de una tarjeta de producto
-                if (el.closest("a[href*='/productos/detalle/']")) continue;
-                const parent = el.parentElement;
-                const chk = parent ? parent.querySelector("input[type='checkbox']") : null;
-                if (chk) {
-                    chk.click();
-                    return true;
+    # Pulsar 'Ver más' si está dentro del bloque de Fabricantes
+    await page.evaluate("""() => {
+        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
+            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
+        for (const h of headers) {
+            let box = h.parentElement;
+            for (let i = 0; i < 4 && box; i++) {
+                const verMas = Array.from(box.querySelectorAll("a, button, span, div"))
+                    .find(el => /^Ver más$/i.test((el.innerText || "").trim()));
+                if (verMas) {
+                    verMas.click();
+                    break;
                 }
-                el.click();
-                return true;
+                box = box.parentElement;
+            }
+        }
+    }""")
+    await page.wait_for_timeout(1200)
+
+    # 2. Localizar específicamente la sección 'Fabricantes' y marcar el checkbox de 'ASUS'
+    marcado = await page.evaluate("""() => {
+        const headers = Array.from(document.querySelectorAll("div, span, button, a, h3, h4, h5"))
+            .filter(el => /^Fabricantes$/i.test((el.innerText || "").trim()));
+
+        for (const h of headers) {
+            let box = h.parentElement;
+            for (let i = 0; i < 4 && box; i++) {
+                const items = Array.from(box.querySelectorAll("label, li, div"));
+                for (const item of items) {
+                    const txt = (item.innerText || "").trim();
+                    if (/^ASUS(\\s*\\d+|\\s*\\(\\d+\\))?$/i.test(txt)) {
+                        const chk = item.querySelector("input[type='checkbox']") ||
+                                    (item.parentElement ? item.parentElement.querySelector("input[type='checkbox']") : null);
+                        if (chk) {
+                            if (!chk.checked) chk.click();
+                            return true;
+                        }
+                        item.click();
+                        return true;
+                    }
+                }
+                box = box.parentElement;
             }
         }
         return false;
     }""")
 
-    if aplicado:
+    await page.wait_for_timeout(3000)
+
+    # Verificar que realmente se aplicó el filtro mirando el primer producto
+    primer_prod = await page.evaluate("""() => {
+        const a = document.querySelector("a[href*='/productos/detalle/']");
+        return a ? (a.innerText || "").trim() : "";
+    }""")
+    log(f"   Checkbox ASUS marcado: {marcado} | Primer producto visible: '{primer_prod[:60]}'")
+
+    # Respaldo: si no se aplicó el filtro lateral, usar la URL de búsqueda con fabricante ASUS
+    if not marcado or ("ASUS" not in primer_prod.upper() and "EXPERT" not in primer_prod.upper()):
+        log("   Usando URL directa filtrada por ASUS como respaldo...")
+        await page.goto("https://pistacierto.com/buscador?search=ASUS&size=100", wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(3000)
-        log("   Filtro 'Fabricantes -> ASUS' activado correctamente.")
-    else:
-        log("   Aviso: no se encontró el checkbox lateral ASUS; se usará el buscador como respaldo.")
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
@@ -154,7 +194,6 @@ async def ejecutar_scraping():
             viewport={"width": 1600, "height": 1000},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
-        # Bloquear descarga de imágenes y fuentes para acelerar carga (conserva alt/title/src en el DOM)
         await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm,png,jpg,jpeg,webp,gif,svg}", lambda route: route.abort())
 
         cookies_str = datos_sesion.get("cookies", "")
@@ -199,7 +238,6 @@ async def ejecutar_scraping():
             await cerrar_popups(page)
             await page.wait_for_timeout(1500)
 
-            # Pulsar TODOS los botones "Mostrar mayoristas" / "Ver mayoristas" de la página actual
             botones_mostrar = page.locator("text=/Mostrar mayoristas|Ver mayoristas/i")
             total_botones = await botones_mostrar.count()
             log(f"2. Página {pagina_actual}: desplegando {total_botones} botones 'Mostrar mayoristas'...")
@@ -226,10 +264,10 @@ async def ejecutar_scraping():
                     if (!titulo || titulo.length < 5) continue;
                     const urlProd = enlace.href.split("?")[0];
 
-                    // Subir hasta el contenedor completo de la tarjeta (incluye cabecera + panel desplegado de mayoristas)
+                    // Subir hasta el contenedor completo de la fila de producto (incluye tarjeta + panel desplegado inferior)
                     let cont = enlace.parentElement;
                     let mejorCont = null;
-                    for (let nivel = 0; nivel < 10 && cont; nivel++) {
+                    for (let nivel = 0; nivel < 12 && cont; nivel++) {
                         const enlacesEnCont = cont.querySelectorAll("a[href*='/productos/detalle/']").length;
                         if (enlacesEnCont > 2) break;
                         const txt = cont.innerText || "";
@@ -242,15 +280,23 @@ async def ejecutar_scraping():
                     if (!mejorCont || vistas.has(mejorCont)) continue;
                     vistas.add(mejorCont);
 
-                    const textoTarjeta = mejorCont.innerText || "";
+                    // Si el panel de mayoristas desplegado está como hermano siguiente de mejorCont, incluirlo también
+                    let textoCompleto = mejorCont.innerText || "";
+                    let contenedorBusqueda = mejorCont;
+                    const sig = mejorCont.nextElementSibling;
+                    if (sig && !sig.querySelector("a[href*='/productos/detalle/']") && /\\d[\\d\\.]*,\\d{2}/.test(sig.innerText || "")) {
+                        textoCompleto += "\\n" + (sig.innerText || "");
+                        contenedorBusqueda = mejorCont.parentElement || mejorCont;
+                    }
 
-                    // Buscar las filas desplegadas de cada mayorista debajo de la tarjeta
+                    // Buscar filas desplegadas de mayoristas (NO exigir el símbolo € porque el CSS lo separa)
                     const filasMayoristas = [];
-                    const candidatos = Array.from(mejorCont.querySelectorAll("div, tr, li")).filter(el => {
+                    const candidatos = Array.from(contenedorBusqueda.querySelectorAll("div, tr, li")).filter(el => {
+                        if (contenedorBusqueda !== mejorCont && !mejorCont.contains(el) && !(sig && sig.contains(el))) return false;
                         const t = (el.innerText || "").trim();
-                        const tienePrecio = /\\d[\\d\\.]*,\\d{2}\\s*€/.test(t);
-                        const esFilaDesplegada = /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock)/i.test(t);
-                        const esCuadroSuperior = /STOCK:\\s*\\d+/i.test(t) && !/canon/i.test(t);
+                        const tienePrecio = /\\d[\\d\\.]*,\\d{2}/.test(t);
+                        const esFilaDesplegada = /(u\\.|canon|Sin stock|PISTACERO|IDIOMUND|DEPAU|INFORPOR|ESPRINET|SYNNEX|MCR|VALORISTA|MEGASUR|HISPAMICRO)/i.test(t);
+                        const esCuadroSuperior = /STOCK:\\s*\\d+/i.test(t) && !/canon/i.test(t) && !/\\(\\d+\\s*u\\.\\)/i.test(t);
                         return tienePrecio && esFilaDesplegada && !esCuadroSuperior && t.length < 320;
                     });
 
@@ -261,7 +307,7 @@ async def ejecutar_scraping():
 
                         const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
                             const st = (s.innerText || "").trim();
-                            return /\\d[\\d\\.]*,\\d{2}\\s*€/.test(st) && /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock)/i.test(st) && st.length < 320;
+                            return /\\d[\\d\\.]*,\\d{2}/.test(st) && /(u\\.|canon|Sin stock|PISTACERO|IDIOMUND|DEPAU|INFORPOR|ESPRINET|SYNNEX|MCR|VALORISTA|MEGASUR|HISPAMICRO)/i.test(st) && st.length < 320;
                         });
                         if (sub.length > 0) continue;
 
@@ -277,7 +323,7 @@ async def ejecutar_scraping():
                     resultados.push({
                         titulo: titulo,
                         url: urlProd,
-                        textoTarjeta: textoTarjeta,
+                        textoTarjeta: textoCompleto,
                         mayoristas: filasMayoristas
                     });
                 }
@@ -287,7 +333,7 @@ async def ejecutar_scraping():
             if not diagnostico_hecho and tarjetas_pagina:
                 diagnostico_hecho = True
                 t0 = tarjetas_pagina[0]
-                log(f"   [Diagnóstico Tarjeta 1] Texto desplegado: {t0['textoTarjeta'][:380].replace(chr(10), ' | ')}")
+                log(f"   [Diagnóstico Tarjeta 1] Texto desplegado: {t0['textoTarjeta'][:420].replace(chr(10), ' | ')}")
                 log(f"   [Diagnóstico Tarjeta 1] Filas mayoristas detectadas ({len(t0['mayoristas'])}): {t0['mayoristas']}")
 
             if not tarjetas_pagina:
@@ -302,7 +348,7 @@ async def ejecutar_scraping():
 
                 txt_card = prod["textoTarjeta"]
 
-                # Extraer P/N de la etiqueta bajo el título (ej: 90NX09T2-M008F0 o P1403CVA-S62015X)
+                # Extraer P/N de la etiqueta bajo el título
                 pn = ""
                 for linea in [l.strip() for l in txt_card.split("\n") if l.strip()]:
                     if linea.lower() in ["asus", "mostrar mayoristas", "ocultar mayoristas", "añadir", "comparar", "sin stock"]:
@@ -318,9 +364,9 @@ async def ejecutar_scraping():
                     txt_m = m["texto"]
                     mayorista = extraer_nombre_mayorista(m["imgs"], txt_m)
 
-                    precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt_m)
+                    precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt_m)
                     m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt_m, re.I)
-                    m_stock = re.search(r"\((\d+)\s*u\.\)", txt_m, re.I)
+                    m_stock = re.search(r"(\d+)\s*u\.", txt_m, re.I)
 
                     precio = limpiar_numero(precios[0]) if precios else None
                     canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
@@ -358,7 +404,6 @@ async def ejecutar_scraping():
                     await btn_next.click(force=True)
                     await page.wait_for_timeout(3000)
 
-                    # Verificar si realmente avanzó de página
                     primer_titulo_nuevo = await page.evaluate("""() => {
                         const a = document.querySelector("a[href*='/productos/detalle/']");
                         return a ? (a.innerText || "").trim() : "";

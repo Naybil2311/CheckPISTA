@@ -12,7 +12,7 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
-URL_INICIO = "https://pistacierto.com/inicio"
+URL_LOGIN = "https://pistacierto.com/login"
 URL_CATALOGO = "https://pistacierto.com/productos"
 
 def limpiar_numero(texto):
@@ -56,51 +56,62 @@ async def ejecutar_scraping():
         await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm}", lambda route: route.abort())
         page = await context.new_page()
 
-        print(f"1. Accediendo a {URL_INICIO} para iniciar sesión...")
-        await page.goto(URL_INICIO, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(2000)
-
-        # Si el formulario de login está en /inicio o tras pulsar botón de acceso
-        inputs_pass = page.locator("input[type='password']")
-        if await inputs_pass.count() == 0:
-            btn_login = page.locator("button:has-text('Iniciar sesión'), a:has-text('Iniciar sesión'), button:has-text('Acceder'), a:has-text('Acceder'), button:has-text('Entrar')").first
-            if await btn_login.count() > 0:
-                await btn_login.click()
-                await page.wait_for_timeout(1500)
+        print(f"1. Accediendo a {URL_LOGIN} para iniciar sesión...")
+        await page.goto(URL_LOGIN, wait_until="networkidle", timeout=60000)
+        await page.wait_for_selector("input[type='password']", timeout=20000)
 
         inputs_texto = page.locator("input[type='email'], input[type='text']")
         inputs_pass = page.locator("input[type='password']")
 
-        if await inputs_texto.count() > 0 and await inputs_pass.count() > 0:
-            await inputs_texto.first.fill(usuario)
-            await inputs_pass.first.fill(password)
-            await inputs_pass.first.press("Enter")
-            await page.wait_for_timeout(4500)
+        await inputs_texto.first.fill(usuario)
+        await inputs_pass.first.fill(password)
+
+        # Hacer clic en el botón de iniciar sesión si existe, o pulsar Enter
+        btn_submit = page.locator("button[type='submit'], button:has-text('Iniciar'), button:has-text('Entrar'), button:has-text('Acceder')").first
+        if await btn_submit.count() > 0:
+            await btn_submit.click()
         else:
-            print("Aviso: No se localizaron campos de login visibles en /inicio.")
+            await inputs_pass.first.press("Enter")
 
-        print(f"2. Sesión iniciada. URL actual: {page.url} -> Navegando al catálogo ASUS...")
+        # Esperar a que la URL deje de ser /login
+        try:
+            await page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
+        except Exception:
+            await page.wait_for_timeout(4000)
+
+        await page.wait_for_load_state("networkidle")
+        print(f"2. Sesión iniciada correctamente. URL actual: {page.url}")
+
+        if "/login" in page.url:
+            print("Error: Sigue en /login. Verifica que PC_USER y PC_PASS sean correctos.")
+            await browser.close()
+            return False
+
+        # Ir al catálogo y buscar ASUS
         await page.goto(URL_CATALOGO, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(2000)
 
-        # Filtrar por ASUS en el buscador y/o filtro de fabricante
         buscador = page.locator("input[placeholder*='Buscar'], input[type='search'], input[name*='search']").first
         if await buscador.count() > 0:
             await buscador.fill("ASUS")
             await buscador.press("Enter")
-            await page.wait_for_timeout(3500)
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(2500)
 
         filtro_asus = page.locator("label:has-text('ASUS'), span:has-text('ASUS'), a:has-text('ASUS')").first
         try:
             if await filtro_asus.is_visible():
                 await filtro_asus.click()
-                await page.wait_for_timeout(3000)
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(2500)
         except Exception:
             pass
 
         pagina_actual = 1
         while True:
-            print(f"3. Procesando página {pagina_actual} del catálogo...")
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(1500)
+            print(f"3. Procesando página {pagina_actual} del catálogo (URL: {page.url})...")
 
             # Pulsar todos los botones "Ver mayoristas" cerrados en la página actual
             botones_ver = page.locator("text=/Ver mayoristas/i")
@@ -110,78 +121,87 @@ async def ejecutar_scraping():
                     btn = botones_ver.nth(i)
                     if await btn.is_visible():
                         await btn.click()
-                        await page.wait_for_timeout(250)
+                        await page.wait_for_timeout(200)
                 except Exception:
                     continue
 
+            await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(1500)
 
-            # Extraer cada tarjeta de producto y todas sus filas de mayoristas desplegadas
-            productos_pagina = await page.evaluate("""() => {
-                const tarjetas = [];
-                const enlacesProd = Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"));
-                const tarjetasVistas = new Set();
+            # Extraer tarjetas con reintento si ocurre una navegación intermedia
+            productos_pagina = []
+            for intento in range(3):
+                try:
+                    productos_pagina = await page.evaluate("""() => {
+                        const tarjetas = [];
+                        const enlacesProd = Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"));
+                        const tarjetasVistas = new Set();
 
-                for (const enlace of enlacesProd) {
-                    const titulo = (enlace.innerText || "").trim();
-                    if (!titulo || titulo.length < 5) continue;
+                        for (const enlace of enlacesProd) {
+                            const titulo = (enlace.innerText || "").trim();
+                            if (!titulo || titulo.length < 5) continue;
 
-                    let cont = enlace.parentElement;
-                    while (cont && cont.parentElement) {
-                        const txt = cont.innerText || "";
-                        if ((txt.includes("Ocultar mayoristas") || txt.includes("Ver mayoristas")) && txt.includes("€")) {
-                            break;
+                            let cont = enlace.parentElement;
+                            while (cont && cont.parentElement) {
+                                const txt = cont.innerText || "";
+                                if ((txt.includes("Ocultar mayoristas") || txt.includes("Ver mayoristas")) && txt.includes("€")) {
+                                    break;
+                                }
+                                cont = cont.parentElement;
+                            }
+                            if (!cont || tarjetasVistas.has(cont)) continue;
+                            tarjetasVistas.add(cont);
+
+                            const textoTarjeta = cont.innerText || "";
+                            const urlProd = enlace.href;
+
+                            const lineas = textoTarjeta.split("\\n").map(l => l.trim()).filter(Boolean);
+                            let pn = "";
+                            let esAsus = textoTarjeta.toUpperCase().includes("ASUS");
+
+                            for (const l of lineas) {
+                                if (/^[0-9A-Z]{2}[0-9A-Z]{4,8}-[0-9A-Z]{4,8}$/i.test(l)) {
+                                    pn = l;
+                                    break;
+                                }
+                            }
+
+                            const filasMayoristas = [];
+                            const candidatos = Array.from(cont.querySelectorAll("div, tr")).filter(el => {
+                                const t = el.innerText || "";
+                                return t.includes("€") && (t.includes("u.)") || t.includes("Sin stock")) && t.length < 220;
+                            });
+
+                            const filasVistas = new Set();
+                            for (const fila of candidatos) {
+                                const t = fila.innerText.trim();
+                                if (filasVistas.has(t)) continue;
+                                const sub = Array.from(fila.querySelectorAll("div, tr")).filter(s => {
+                                    const st = s.innerText || "";
+                                    return st.includes("€") && (st.includes("u.)") || st.includes("Sin stock")) && st.length < 220;
+                                });
+                                if (sub.length > 0) continue;
+                                filasVistas.add(t);
+
+                                const imgs = Array.from(fila.querySelectorAll("img")).map(img => [img.alt || "", img.src || ""]);
+                                filasMayoristas.push({ texto: t, imgs: imgs });
+                            }
+
+                            tarjetas.push({
+                                titulo: titulo,
+                                pn: pn,
+                                esAsus: esAsus,
+                                url: urlProd,
+                                mayoristas: filasMayoristas
+                            });
                         }
-                        cont = cont.parentElement;
-                    }
-                    if (!cont || tarjetasVistas.has(cont)) continue;
-                    tarjetasVistas.add(cont);
-
-                    const textoTarjeta = cont.innerText || "";
-                    const urlProd = enlace.href;
-
-                    const lineas = textoTarjeta.split("\\n").map(l => l.trim()).filter(Boolean);
-                    let pn = "";
-                    let esAsus = textoTarjeta.toUpperCase().includes("ASUS");
-
-                    for (const l of lineas) {
-                        if (/^[0-9A-Z]{2}[0-9A-Z]{4,8}-[0-9A-Z]{4,8}$/i.test(l)) {
-                            pn = l;
-                            break;
-                        }
-                    }
-
-                    const filasMayoristas = [];
-                    const candidatos = Array.from(cont.querySelectorAll("div, tr")).filter(el => {
-                        const t = el.innerText || "";
-                        return t.includes("€") && (t.includes("u.)") || t.includes("Sin stock")) && t.length < 220;
-                    });
-
-                    const filasVistas = new Set();
-                    for (const fila of candidatos) {
-                        const t = fila.innerText.trim();
-                        if (filasVistas.has(t)) continue;
-                        const sub = Array.from(fila.querySelectorAll("div, tr")).filter(s => {
-                            const st = s.innerText || "";
-                            return st.includes("€") && (st.includes("u.)") || st.includes("Sin stock")) && st.length < 220;
-                        });
-                        if (sub.length > 0) continue;
-                        filasVistas.add(t);
-
-                        const imgs = Array.from(fila.querySelectorAll("img")).map(img => [img.alt || "", img.src || ""]);
-                        filasMayoristas.push({ texto: t, imgs: imgs });
-                    }
-
-                    tarjetas.push({
-                        titulo: titulo,
-                        pn: pn,
-                        esAsus: esAsus,
-                        url: urlProd,
-                        mayoristas: filasMayoristas
-                    });
-                }
-                return tarjetas;
-            }""")
+                        return tarjetas;
+                    }""")
+                    break
+                except Exception as e:
+                    print(f"   Reintentando lectura tras navegación interna ({intento + 1}/3)...")
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(2000)
 
             for prod in productos_pagina:
                 if not prod["esAsus"]:
@@ -226,7 +246,8 @@ async def ejecutar_scraping():
                 try:
                     antes_count = len(registros)
                     await btn_siguiente.click()
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(2500)
                     if len(registros) == antes_count and pagina_actual > 1:
                         break
                     pagina_actual += 1

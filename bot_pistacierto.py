@@ -52,7 +52,6 @@ MAPA_MAYORISTAS_UUID = {
     "7898e114-5073-47c7-960f-36f9c65cfd02": "Globomatik",
 }
 
-# Cambia a True si también quieres guardar en el CSV las filas marcadas como "Sin stock"
 INCLUIR_SIN_STOCK = True
 CONCURRENCIA_FICHAS = 8
 
@@ -96,12 +95,10 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
     combinado = " ".join(partes)
     combinado_up = combinado.upper()
 
-    # 1. Coincidencia directa con UUID conocido en MAPA_MAYORISTAS_UUID
     for uuid_key, nombre_comercial in MAPA_MAYORISTAS_UUID.items():
         if uuid_key.lower() in combinado.lower():
             return nombre_comercial
 
-    # 2. Coincidencia directa por nombre comercial visible o en atributos/clases
     mapa_texto = [
         ("PISTACERO", "PISTACERO (Compra Agrupada)"),
         ("COMPRA AGRUPADA", "PISTACERO (Compra Agrupada)"),
@@ -142,7 +139,6 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
         if clave in combinado_up:
             return nombre_limpio
 
-    # 3. Extraer UUID de URLs /mayoristas/<uuid>.<ext>
     m_uuid = re.search(
         r"/mayoristas/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
         combinado,
@@ -208,11 +204,15 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     let fila = hoja.closest("tr");
                     if (!fila) {
                         let cur = hoja.parentElement;
-                        for (let nivel = 0; nivel < 7 && cur; nivel++) {
-                            const imgs = cur.querySelectorAll("img").length;
+                        for (let nivel = 0; nivel < 4 && cur; nivel++) {
                             const preciosEnFila = (cur.innerText || "").match(/\\d[\\d\\.]*,\\d{2}/g) || [];
-                            if (preciosEnFila.length > 3) break;
-                            if (imgs > 0) {
+                            if (preciosEnFila.length > 2) break;
+                            const tieneVisual = cur.querySelectorAll("img").length > 0 ||
+                                Array.from(cur.querySelectorAll("*")).some(n => {
+                                    const bg = getComputedStyle(n).backgroundImage || n.style.backgroundImage || "";
+                                    return bg && bg !== "none";
+                                });
+                            if (tieneVisual) {
                                 fila = cur;
                                 break;
                             }
@@ -225,43 +225,21 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     filasVistas.add(contenedor);
 
                     const pistas = [];
-                    const recolectarDeAmbito = (ambito, soloMayoristas = false) => {
-                        if (!ambito) return;
-                        ambito.querySelectorAll("*").forEach(nodo => {
-                            if (nodo.tagName === "IMG") {
-                                for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
-                                    const val = nodo.getAttribute(attr);
-                                    if (val && val.trim()) {
-                                        if (!soloMayoristas || val.toLowerCase().includes("mayorista")) {
-                                            pistas.push(val.trim());
-                                        }
-                                    }
-                                }
+                    contenedor.querySelectorAll("*").forEach(nodo => {
+                        if (nodo.tagName === "IMG") {
+                            for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
+                                const val = nodo.getAttribute(attr);
+                                if (val && val.trim()) pistas.push(val.trim());
                             }
-                            const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
-                            if (bg && bg !== "none") {
-                                if (!soloMayoristas || bg.toLowerCase().includes("mayorista")) {
-                                    pistas.push(bg);
-                                }
-                            }
-                            const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
-                            if (aria.trim()) pistas.push(aria.trim());
-                            const cls = typeof nodo.className === "string" ? nodo.className : "";
-                            if (cls && cls.toLowerCase().includes("mayorista")) pistas.push(cls);
-                        });
-                    };
-
-                    recolectarDeAmbito(contenedor, false);
-                    if (contenedor.parentElement) {
-                        recolectarDeAmbito(contenedor.parentElement, true);
-                    }
-
-                    const textoFila = (contenedor.innerText || "").trim();
-                    const textoPadre = (contenedor.parentElement?.innerText || "").trim();
+                        }
+                        const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
+                        if (bg && bg !== "none") pistas.push(bg);
+                        const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
+                        if (aria.trim()) pistas.push(aria.trim());
+                    });
 
                     bloques.push({
-                        texto: textoFila,
-                        texto_contexto: textoPadre.slice(0, 1200),
+                        texto: (contenedor.innerText || "").trim(),
                         pistas: pistas,
                         html: contenedor.outerHTML.slice(0, 1000)
                     });
@@ -279,28 +257,21 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
             ofertas_ficha = {}
             for b in datos_dom["bloques"]:
                 txt = b["texto"]
-                ctx = b.get("texto_contexto", "")
 
                 if re.search(r"(Sin Título|Tramitado|\bproductos\b)", txt, re.I):
                     continue
-                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", f"{txt}\n{ctx}", re.I):
+                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", txt, re.I):
                     continue
 
-                # 1. Identificar mayorista usando las pistas de la fila (y respaldo del padre si aplica)
                 mayorista = normalizar_mayorista(b["pistas"], txt, b["html"])
 
-                # 2. Extraer precio, canon y stock EXCLUSIVAMENTE del texto propio de la fila (txt)
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
-                m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
-                if not m_canon:
-                    m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", ctx, re.I)
+                m_canon = re.search(r"\+?\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
                 m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
 
                 precio = limpiar_numero(precios[0]) if precios else None
                 canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
                 stock = int(m_stock.group(1)) if m_stock else 0
-
-                # Solo es "Sin stock" si la propia fila dice "sin stock" y NO tiene unidades ("u.") > 0
                 sin_stock = (stock == 0) and (bool(re.search(r"\bsin stock\b", txt, re.I)) or precio == 0.0)
 
                 if sin_stock and not INCLUIR_SIN_STOCK:

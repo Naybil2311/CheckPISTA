@@ -28,8 +28,7 @@ jobs:
 
       - name: Ejecutar monitor multimayorista ASUS
         env:
-          PC_USER: ${{ secrets.PC_USER }}
-          PC_PASS: ${{ secrets.PC_PASS }}
+          PC_SESSION: ${{ secrets.PC_SESSION }}
         run: python bot_pistacierto.py
 
       - name: Comprobar si hay cambios nuevos

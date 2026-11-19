@@ -36,11 +36,29 @@ EXCLUIR_ACCESORIOS = [
     "FUENTE DE ALIMENTACION", "CARGADOR", "DOCK", "MALETIN", "MALETÍN"
 ]
 
+MAPA_MAYORISTAS_UUID = {
+    "b53ec8ba-cfaa-43a1-a7f2-c3fbab7ad6b6": "Hispamicro",
+    "edf99b17-03e6-4ba2-8898-6339440e4378": "Depau",
+    "bff85f34-220c-4b56-a2ce-be10776e1d35": "Infortisa",
+    "0b49e0aa-edca-411d-a417-d5e0b5ce2ec6": "Valorista",
+    "38d5e378-6eb5-4b9a-b9b8-efa71e36f5d2": "Esprinet",
+    "64ed262e-4163-49b2-aa10-7444943d14ac": "TDSynnex",
+    "403dd8f5-ed93-4411-80f9-8628218a1479": "Ibertronica",
+    "be01559f-4eb3-4b1f-a855-cd598ac0d406": "DMI",
+    "64920c2b-a115-43e0-81d2-8ded450e4083": "Desyman",
+    "98dd0791-fb9c-4a0b-b5d1-88f4d04297dd": "ASEUROPA",
+    "c571c940-2b35-4620-8253-f07d1620f016": "Inforpor",
+    "8ede237b-196d-4f2b-9573-0b590bfbe5bb": "Idiomund",
+    "7898e114-5073-47c7-960f-36f9c65cfd02": "Globomatik",
+}
+
 INCLUIR_SIN_STOCK = False
 CONCURRENCIA_FICHAS = 8
 
+
 def log(msg):
     print(msg, flush=True)
+
 
 def limpiar_numero(texto):
     if texto is None:
@@ -55,6 +73,7 @@ def limpiar_numero(texto):
     m = re.search(r"\d+(?:\.\d+)?", txt)
     return float(m.group(0)) if m else None
 
+
 def es_equipo_valido(titulo):
     up = titulo.upper()
     if any(exc in up for exc in EXCLUIR_ACCESORIOS):
@@ -67,23 +86,31 @@ def es_equipo_valido(titulo):
     ]
     return any(c in up for c in claves_ok)
 
+
 def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
     partes = [texto_fila or "", html_fila or ""]
     if pistas_fila:
         for p in pistas_fila:
             partes.append(str(p or ""))
-    combinado = " ".join(partes).upper()
+    combinado = " ".join(partes)
+    combinado_up = combinado.upper()
 
-    mapa = [
+    # 1. Buscar coincidencia directa con UUID conocido en MAPA_MAYORISTAS_UUID
+    for uuid_key, nombre_comercial in MAPA_MAYORISTAS_UUID.items():
+        if uuid_key.lower() in combinado.lower():
+            return nombre_comercial
+
+    # 2. Buscar nombres comerciales o palabras clave conocidas
+    mapa_texto = [
         ("PISTACERO", "PISTACERO (Compra Agrupada)"),
         ("COMPRA AGRUPADA", "PISTACERO (Compra Agrupada)"),
         ("IDIOMUN", "Idiomund"),
         ("GRUPO SII", "Idiomund"),
-        ("TD SYNNEX", "TD SYNNEX"),
-        ("TDSYNNEX", "TD SYNNEX"),
-        ("SYNNEX", "TD SYNNEX"),
-        ("TECH DATA", "TD SYNNEX"),
-        ("TECHDATA", "TD SYNNEX"),
+        ("TD SYNNEX", "TDSynnex"),
+        ("TDSYNNEX", "TDSynnex"),
+        ("SYNNEX", "TDSynnex"),
+        ("TECH DATA", "TDSynnex"),
+        ("TECHDATA", "TDSynnex"),
         ("DEPAU", "Depau"),
         ("INFORPOR", "Inforpor"),
         ("ESPRINET", "Esprinet"),
@@ -98,7 +125,10 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
         ("BINARY", "Binary"),
         ("GTI", "GTI"),
         ("ARROW", "Arrow"),
-        ("DMI", "DMI Computer"),
+        ("DMI", "DMI"),
+        ("IBERTRONICA", "Ibertronica"),
+        ("DESYMAN", "Desyman"),
+        ("ASEUROPA", "ASEUROPA"),
         ("TICNOVA", "Ticnova"),
         ("ALSO", "ALSO"),
         ("WESTCON", "Westcon"),
@@ -107,27 +137,27 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
         ("INFORTISA", "Infortisa"),
         ("UNYKA", "Unyka"),
     ]
-    for clave, nombre_limpio in mapa:
-        if clave in combinado:
+    for clave, nombre_limpio in mapa_texto:
+        if clave in combinado_up:
             return nombre_limpio
 
-    if pistas_fila:
-        for pista in pistas_fila:
-            s = str(pista or "").strip()
-            if not s or s.startswith("data:") or s.startswith("http"):
-                continue
-            # Limpiar nombres de archivo si vienen en pista
-            if "/" in s or "\\" in s:
-                archivo = s.split("/")[-1].split("\\")[-1].split("?")[0]
-                nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
-                nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
-                nombre = re.sub(r"[-_]", " ", nombre).strip()
-                if nombre and len(nombre) > 1 and not nombre.isdigit():
-                    return nombre.upper() if len(nombre) <= 4 else nombre.title()
-            elif len(s) > 1 and not s.isdigit() and not any(x in s.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon", "carrito", "añadir", "row", "col", "flex", "btn", "text", "card", "ng-"]):
-                return s
+    # 3. Extraer UUID de URLs de /mayoristas/<uuid>.<ext>
+    m_uuid = re.search(
+        r"/mayoristas/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        combinado,
+        re.I,
+    )
+    if m_uuid:
+        uuid_encontrado = m_uuid.group(1).lower()
+        return MAPA_MAYORISTAS_UUID.get(uuid_encontrado, uuid_encontrado)
+
+    m_may = re.search(r"/mayoristas/([a-zA-Z0-9_-]+)\.(?:png|jpg|jpeg|svg|webp)", combinado, re.I)
+    if m_may:
+        token = m_may.group(1).lower()
+        return MAPA_MAYORISTAS_UUID.get(token, f"Mayorista {token[:8]}")
 
     return "Mayorista Desconocido"
+
 
 async def cerrar_popups(page):
     for _ in range(2):
@@ -145,6 +175,7 @@ async def cerrar_popups(page):
         except Exception:
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(200)
+
 
 async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fecha_ejecucion, progreso):
     async with sem:
@@ -193,7 +224,6 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     filasVistas.add(contenedor);
 
                     const pistas = [];
-                    // Recoger atributos de <img> y background-image en estilos inline/computados
                     contenedor.querySelectorAll("*").forEach(nodo => {
                         if (nodo.tagName === "IMG") {
                             for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
@@ -206,6 +236,19 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                         const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
                         if (aria.trim()) pistas.push(aria.trim());
                     });
+
+                    if (pistas.length === 0 && contenedor.parentElement) {
+                        contenedor.parentElement.querySelectorAll("img, *").forEach(nodo => {
+                            if (nodo.tagName === "IMG") {
+                                for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
+                                    const val = nodo.getAttribute(attr);
+                                    if (val && val.includes("mayoristas")) pistas.push(val.trim());
+                                }
+                            }
+                            const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
+                            if (bg && bg.includes("mayoristas")) pistas.push(bg);
+                        });
+                    }
 
                     bloques.push({
                         texto: (contenedor.innerText || "").trim(),
@@ -226,6 +269,8 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
             ofertas_ficha = {}
             for b in datos_dom["bloques"]:
                 txt = b["texto"]
+                if re.search(r"(Sin Título|Tramitado|\bproductos\b)", txt, re.I):
+                    continue
                 if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir)", txt, re.I):
                     continue
 
@@ -274,6 +319,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 log(f"   Progreso fichas: {progreso['hechas']}/{progreso['total']} analizadas...")
 
         return filas_resultado
+
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
@@ -425,6 +471,7 @@ async def ejecutar_scraping():
     log(f"\n✅ Completado: {len(df)} filas reales (Equipo x Mayorista) guardadas en {ruta_hist}")
     return True
 
+
 def comparar_tarifas():
     if os.path.exists(ARCHIVO_CAMBIOS):
         os.remove(ARCHIVO_CAMBIOS)
@@ -463,6 +510,7 @@ def comparar_tarifas():
         log("Sin variaciones de precio en ningún mayorista.")
 
     os.replace(ARCHIVO_NUEVO, ARCHIVO_HISTORICO)
+
 
 if __name__ == "__main__":
     if asyncio.run(ejecutar_scraping()):

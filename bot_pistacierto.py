@@ -14,7 +14,6 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
-# Búsquedas completas para cubrir todas las familias profesionales B2B y catálogo ASUS
 TERMINOS_BUSQUEDA = [
     "EXPERTBOOK",
     "EXPERTCENTER",
@@ -28,7 +27,6 @@ TERMINOS_BUSQUEDA = [
     "D500", "D700", "D900", "P500", "E1600", "E3402", "E5402"
 ]
 
-# Cambia a True si quieres incluir también filas con precio 0,00€ o "Sin stock" (ej: TD SYNNEX 0,00€)
 INCLUIR_SIN_STOCK = False
 
 def log(msg):
@@ -102,12 +100,12 @@ async def cerrar_popups(page):
                     await btn_ok.click(force=True)
                 else:
                     await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(400)
             else:
                 break
         except Exception:
             await page.keyboard.press("Escape")
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(200)
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
@@ -123,6 +121,7 @@ async def ejecutar_scraping():
 
     registros = []
     urls_procesadas = set()
+    diagnostico_hecho = False
     fecha_ejecucion = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     async with async_playwright() as p:
@@ -131,7 +130,6 @@ async def ejecutar_scraping():
             viewport={"width": 1600, "height": 1000},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
-        # Bloquear descarga visual de imágenes/fuentes (mantiene intactos src/alt/title en el DOM)
         await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm,png,jpg,jpeg,webp,gif,svg}", lambda route: route.abort())
 
         cookies_str = datos_sesion.get("cookies", "")
@@ -184,16 +182,20 @@ async def ejecutar_scraping():
 
                 await cerrar_popups(page)
 
-                # Hacer clic en todos los botones "Ver mayoristas" de la página para desplegar Idiomund, Pistacero, TD Synnex, etc.
+                # Hacer clic real con Playwright en todos los botones "Ver mayoristas" visibles
                 botones_ver = page.locator("text=/Ver mayoristas/i")
                 total_botones = await botones_ver.count()
+                for i in range(total_botones):
+                    try:
+                        btn = botones_ver.nth(i)
+                        if await btn.is_visible():
+                            await btn.click(force=True)
+                            await page.wait_for_timeout(80)
+                    except Exception:
+                        continue
+
                 if total_botones > 0:
-                    await page.evaluate("""() => {
-                        const btns = Array.from(document.querySelectorAll("button, a, span, div"))
-                            .filter(el => /^Ver mayoristas/i.test((el.innerText || "").trim()));
-                        for (const b of btns) { b.click(); }
-                    }""")
-                    await page.wait_for_timeout(2500)
+                    await page.wait_for_timeout(2000)
 
                 tarjetas_pagina = await page.evaluate("""() => {
                     const resultados = [];
@@ -205,7 +207,6 @@ async def ejecutar_scraping():
                         if (!titulo || titulo.length < 5) continue;
                         const urlProd = enlace.href.split("?")[0];
 
-                        // Subir hasta el contenedor completo de la tarjeta (incluye cabecera + panel desplegado de mayoristas)
                         let cont = enlace.parentElement;
                         let mejorCont = null;
                         for (let nivel = 0; nivel < 10 && cont; nivel++) {
@@ -223,15 +224,14 @@ async def ejecutar_scraping():
 
                         const textoTarjeta = mejorCont.innerText || "";
 
-                        // Buscar filas desplegadas de mayoristas: cada fila tiene precio (ej: 608,42€) y unidades "(5 u.)" o "Sin stock" o canon
+                        // Buscar filas desplegadas de mayoristas: cada fila tiene precio en € (ej: 608,42€) y unidades o canon
                         const filasMayoristas = [];
                         const candidatos = Array.from(mejorCont.querySelectorAll("div, tr, li")).filter(el => {
                             const t = (el.innerText || "").trim();
                             const tienePrecio = /\\d[\\d\\.]*,\\d{2}\\s*€/.test(t);
-                            const esFilaDesplegada = /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock)/i.test(t);
-                            // Excluir el cuadro negro superior ("STOCK: 10")
+                            const esFilaDesplegada = /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock|u\\.\\))/i.test(t);
                             const esCuadroSuperior = /STOCK:\\s*\\d+/i.test(t) && !/canon/i.test(t);
-                            return tienePrecio && esFilaDesplegada && !esCuadroSuperior && t.length < 260;
+                            return tienePrecio && esFilaDesplegada && !esCuadroSuperior && t.length < 320;
                         });
 
                         const filasVistas = new Set();
@@ -241,7 +241,7 @@ async def ejecutar_scraping():
 
                             const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
                                 const st = (s.innerText || "").trim();
-                                return /\\d[\\d\\.]*,\\d{2}\\s*€/.test(st) && /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock)/i.test(st) && st.length < 260;
+                                return /\\d[\\d\\.]*,\\d{2}\\s*€/.test(st) && /(\\([0-9]+\\s*u\\.\\)|canon|Sin stock|u\\.\\))/i.test(st) && st.length < 320;
                             });
                             if (sub.length > 0) continue;
 
@@ -264,6 +264,13 @@ async def ejecutar_scraping():
                     return resultados;
                 }""")
 
+                if not diagnostico_hecho and tarjetas_pagina:
+                    diagnostico_hecho = True
+                    t0 = tarjetas_pagina[0]
+                    log(f"   [Diagnóstico Tarjeta 1] Botones 'Ver mayoristas' pulsados: {total_botones}")
+                    log(f"   [Diagnóstico Tarjeta 1] Texto tarjeta: {t0['textoTarjeta'][:350].replace(chr(10), ' | ')}")
+                    log(f"   [Diagnóstico Tarjeta 1] Filas mayoristas detectadas: {t0['mayoristas']}")
+
                 if not tarjetas_pagina:
                     break
 
@@ -278,7 +285,6 @@ async def ejecutar_scraping():
                     if not es_producto_asus(txt_card):
                         continue
 
-                    # Extraer P/N de la etiqueta bajo el título (ej: P1403CVA-S62015X o 90NX06X1-M002S0)
                     pn = ""
                     for linea in [l.strip() for l in txt_card.split("\n") if l.strip()]:
                         if linea.lower() in ["asus", "ver mayoristas", "ocultar mayoristas", "añadir", "comparar", "sin stock"]:
@@ -295,7 +301,7 @@ async def ejecutar_scraping():
                         mayorista = extraer_nombre_mayorista(m["imgs"], txt_m)
 
                         precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt_m)
-                        m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€\s*canon", txt_m, re.I)
+                        m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt_m, re.I)
                         m_stock = re.search(r"\((\d+)\s*u\.\)", txt_m, re.I)
 
                         precio = limpiar_numero(precios[0]) if precios else None

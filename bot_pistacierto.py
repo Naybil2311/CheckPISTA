@@ -14,21 +14,22 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
-# Búsquedas por líneas comerciales y prefijos P/N oficiales de ASUS (portátiles, sobremesas, AiO, miniPC)
+# Enfocado a equipos y gama comercial/profesional ASUS (evita miles de accesorios y componentes)
 TERMINOS_BUSQUEDA = [
     "EXPERTBOOK",
     "EXPERTCENTER",
+    "ASUSPRO",
     "90NX",      # Portátiles ASUS (ExpertBook, ZenBook, VivoBook, Chromebook)
     "90PF",      # Sobremesas ASUS (ExpertCenter D/P/M, ProArt)
     "90PT",      # All-in-One ASUS (ExpertCenter E1/E3/E5, Vivo AiO)
-    "90MS",      # Mini PC ASUS (ExpertCenter PN/PB)
-    "ASUSPRO",
-    "ASUS"
+    "90MS"       # Mini PC ASUS (ExpertCenter PN/PB)
 ]
 
-# Cambia a True si quieres incluir también mayoristas sin stock de la sección "Sin stock (X)"
 INCLUIR_SIN_STOCK = False
-CONCURRENCIA_FICHAS = 5
+CONCURRENCIA_FICHAS = 8
+
+def log(msg):
+    print(msg, flush=True)
 
 def limpiar_numero(texto):
     if not texto:
@@ -67,7 +68,7 @@ def es_producto_asus(texto):
     return any(c in up for c in claves)
 
 async def cerrar_popups(page):
-    for _ in range(3):
+    for _ in range(2):
         try:
             modal = page.locator(".swal2-container.swal2-backdrop-show")
             if await modal.count() > 0:
@@ -76,28 +77,27 @@ async def cerrar_popups(page):
                     await btn_ok.click(force=True)
                 else:
                     await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(400)
             else:
                 break
         except Exception:
             await page.keyboard.press("Escape")
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(200)
 
-async def extraer_ficha_producto(context, sem, url_prod, titulo_previo, fecha_ejecucion):
+async def extraer_ficha_producto(context, sem, url_prod, titulo_previo, fecha_ejecucion, progreso):
     async with sem:
         page = await context.new_page()
         filas_resultado = []
         try:
-            await page.goto(url_prod, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(2000)
-            await cerrar_popups(page)
+            await page.goto(url_prod, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1200)
 
             if INCLUIR_SIN_STOCK:
                 try:
                     btn_sin_stock = page.locator("text=/Sin stock/i").first
                     if await btn_sin_stock.count() > 0 and await btn_sin_stock.is_visible():
                         await btn_sin_stock.click(force=True)
-                        await page.wait_for_timeout(800)
+                        await page.wait_for_timeout(600)
                 except Exception:
                     pass
 
@@ -106,14 +106,12 @@ async def extraer_ficha_producto(context, sem, url_prod, titulo_previo, fecha_ej
                 const h1 = document.querySelector("h1, h2, .product-title, .titulo-producto");
                 const titulo = h1 ? (h1.innerText || "").trim() : "";
 
-                // Extraer P/N oficial de la cabecera ("P/N: 90PT0391-M01FZ0")
                 let pn = "";
                 const mPn = bodyTxt.match(/P\\/N:\\s*([A-Z0-9\\-\\.]+)/i);
                 if (mPn) {
                     pn = mPn[1].trim();
                 }
 
-                // Buscar todas las filas de mayoristas dentro de la ficha
                 const filas = [];
                 const contenedores = Array.from(document.querySelectorAll("div, tr")).filter(el => {
                     const t = (el.innerText || "").trim();
@@ -127,7 +125,6 @@ async def extraer_ficha_producto(context, sem, url_prod, titulo_previo, fecha_ej
                     const t = (el.innerText || "").trim();
                     if (vistas.has(t)) continue;
 
-                    // Quedarnos con el contenedor más interno que tenga precio + stock
                     const hijos = Array.from(el.querySelectorAll("div, tr")).filter(h => {
                         const ht = (h.innerText || "").trim();
                         return /\\d[\\d\\.]*,\\d{2}\\s*€/.test(ht) && /(\\d+\\s*u\\.|Sin stock)/i.test(ht) && ht.length < 300;
@@ -147,64 +144,64 @@ async def extraer_ficha_producto(context, sem, url_prod, titulo_previo, fecha_ej
             }""")
 
             titulo_final = datos_ficha["titulo"] or titulo_previo
-            if not es_producto_asus(titulo_final + " " + datos_ficha["bodyTxt"]):
-                await page.close()
-                return []
+            if es_producto_asus(titulo_final + " " + datos_ficha["bodyTxt"]):
+                pn_final = datos_ficha["pn"]
+                if not pn_final:
+                    m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{5,8}-[A-Z0-9]{4,8})\b", titulo_final)
+                    pn_final = m_pn_tit.group(1) if m_pn_tit else titulo_final[:35]
 
-            pn_final = datos_ficha["pn"]
-            if not pn_final:
-                m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{5,8}-[A-Z0-9]{4,8})\b", titulo_final)
-                pn_final = m_pn_tit.group(1) if m_pn_tit else titulo_final[:35]
+                for fila in datos_ficha["filas"]:
+                    txt = fila["texto"]
+                    mayorista = limpiar_nombre_mayorista(fila["imgs"], txt)
 
-            for fila in datos_ficha["filas"]:
-                txt = fila["texto"]
-                mayorista = limpiar_nombre_mayorista(fila["imgs"], txt)
+                    precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt)
+                    m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
+                    m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
 
-                precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt)
-                m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€\s*canon", txt, re.I)
-                m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
+                    precio = limpiar_numero(precios[0]) if precios else None
+                    canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
+                    stock = int(m_stock.group(1)) if m_stock else 0
+                    sin_stock = "sin stock" in txt.lower() or stock == 0
 
-                precio = limpiar_numero(precios[0]) if precios else None
-                canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
-                stock = int(m_stock.group(1)) if m_stock else 0
-                sin_stock = "sin stock" in txt.lower() or stock == 0
+                    if sin_stock and not INCLUIR_SIN_STOCK:
+                        continue
 
-                if sin_stock and not INCLUIR_SIN_STOCK:
-                    continue
-
-                if precio is not None:
-                    filas_resultado.append({
-                        "Fecha": fecha_ejecucion,
-                        "P/N": pn_final,
-                        "Modelo": titulo_final,
-                        "Mayorista": mayorista,
-                        "Precio (€)": precio,
-                        "Canon (€)": canon,
-                        "Stock": 0 if sin_stock else stock,
-                        "Estado Stock": "Sin stock" if sin_stock else "Con stock",
-                        "URL": url_prod
-                    })
+                    if precio is not None:
+                        filas_resultado.append({
+                            "Fecha": fecha_ejecucion,
+                            "P/N": pn_final,
+                            "Modelo": titulo_final,
+                            "Mayorista": mayorista,
+                            "Precio (€)": precio,
+                            "Canon (€)": canon,
+                            "Stock": 0 if sin_stock else stock,
+                            "Estado Stock": "Sin stock" if sin_stock else "Con stock",
+                            "URL": url_prod
+                        })
         except Exception:
             pass
         finally:
             await page.close()
+            progreso["hechas"] += 1
+            if progreso["hechas"] % 25 == 0 or progreso["hechas"] == progreso["total"]:
+                log(f"   Progreso fichas: {progreso['hechas']}/{progreso['total']} analizadas...")
 
         return filas_resultado
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
     if not sesion_raw:
-        print("Error: Falta el secreto PC_SESSION en GitHub Actions.")
+        log("Error: Falta el secreto PC_SESSION en GitHub Actions.")
         return False
 
     try:
         datos_sesion = json.loads(sesion_raw)
     except Exception as e:
-        print(f"Error al leer PC_SESSION (formato JSON inválido): {e}")
+        log(f"Error al leer PC_SESSION (formato JSON inválido): {e}")
         return False
 
     fecha_ejecucion = datetime.now().strftime("%Y-%m-%d %H:%M")
-    productos_encontrados = {}  # url -> titulo
+    productos_encontrados = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -212,7 +209,8 @@ async def ejecutar_scraping():
             viewport={"width": 1600, "height": 1000},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
-        await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm}", lambda route: route.abort())
+        # Bloquear fuentes, vídeos e imágenes para que las fichas carguen al instante (conserva el atributo src/alt del DOM)
+        await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm,png,jpg,jpeg,webp,gif,svg}", lambda route: route.abort())
 
         cookies_str = datos_sesion.get("cookies", "")
         if cookies_str:
@@ -240,7 +238,7 @@ async def ejecutar_scraping():
 
         page = await context.new_page()
 
-        # FASE 1: Recopilar todas las fichas únicas de producto ASUS
+        # FASE 1: Recopilar fichas únicas de equipos profesionales ASUS
         for termino in TERMINOS_BUSQUEDA:
             pagina_actual = 1
             while True:
@@ -248,18 +246,18 @@ async def ejecutar_scraping():
                 cargada = False
                 for _ in range(3):
                     try:
-                        await page.goto(url_pagina, wait_until="domcontentloaded", timeout=45000)
-                        await page.wait_for_timeout(2500)
+                        await page.goto(url_pagina, wait_until="domcontentloaded", timeout=30000)
+                        await page.wait_for_timeout(2000)
                         cargada = True
                         break
                     except Exception:
-                        await page.wait_for_timeout(1500)
+                        await page.wait_for_timeout(1000)
 
                 if not cargada:
                     break
 
                 if "/login" in page.url:
-                    print("❌ La sesión guardada en PC_SESSION ha caducado.")
+                    log("❌ La sesión guardada en PC_SESSION ha caducado.")
                     await browser.close()
                     return False
 
@@ -280,7 +278,7 @@ async def ejecutar_scraping():
                         productos_encontrados[item["url"]] = item["titulo"]
                         nuevos += 1
 
-                print(f"Buscador '{termino}' pág. {pagina_actual}: +{nuevos} productos nuevos (Total fichas únicas: {len(productos_encontrados)})")
+                log(f"Buscador '{termino}' pág. {pagina_actual}: +{nuevos} fichas nuevas (Total únicas: {len(productos_encontrados)})")
 
                 if len(enlaces) < 100:
                     break
@@ -289,15 +287,17 @@ async def ejecutar_scraping():
         await page.close()
 
         if not productos_encontrados:
-            print("No se encontraron fichas de productos.")
+            log("No se encontraron fichas de productos.")
             await browser.close()
             return False
 
-        # FASE 2: Entrar en cada ficha y extraer todos los mayoristas y precios
-        print(f"\n2. Extrayendo mayoristas y precios reales de {len(productos_encontrados)} fichas...")
+        # FASE 2: Entrar en cada ficha en paralelo (8 pestañas)
+        log(f"\n2. Extrayendo mayoristas y precios reales de {len(productos_encontrados)} fichas...")
         sem = asyncio.Semaphore(CONCURRENCIA_FICHAS)
+        progreso = {"hechas": 0, "total": len(productos_encontrados)}
+
         tareas = [
-            extraer_ficha_producto(context, sem, url, tit, fecha_ejecucion)
+            extraer_ficha_producto(context, sem, url, tit, fecha_ejecucion, progreso)
             for url, tit in productos_encontrados.items()
         ]
 
@@ -307,7 +307,7 @@ async def ejecutar_scraping():
         await browser.close()
 
     if not registros:
-        print("No se extrajeron filas de mayoristas dentro de las fichas.")
+        log("No se extrajeron filas de mayoristas dentro de las fichas.")
         return False
 
     df = pd.DataFrame(registros).drop_duplicates(subset=["P/N", "Mayorista"])
@@ -325,7 +325,7 @@ async def ejecutar_scraping():
         df_acum = df.copy()
     df_acum.to_csv(ARCHIVO_ACUMULADO, index=False, sep=";", encoding="utf-8-sig")
 
-    print(f"\n3. ¡Completado! Guardados {len(df)} registros reales (Producto x Mayorista) en {ruta_hist}")
+    log(f"\n3. ¡Completado! Guardados {len(df)} registros reales (Producto x Mayorista) en {ruta_hist}")
     return True
 
 def comparar_tarifas():
@@ -336,7 +336,7 @@ def comparar_tarifas():
 
     if not os.path.exists(ARCHIVO_HISTORICO):
         os.replace(ARCHIVO_NUEVO, ARCHIVO_HISTORICO)
-        print("Primera ejecución: tarifa base multimayorista guardada correctamente.")
+        log("Primera ejecución: tarifa base multimayorista guardada correctamente.")
         return
 
     df_ant = pd.read_csv(ARCHIVO_HISTORICO, sep=";", encoding="utf-8-sig")
@@ -361,9 +361,9 @@ def comparar_tarifas():
             "Canon (€)", "Stock Anterior", "Stock Nuevo", "Estado Stock", "Fecha", "URL"
         ]
         cambios[columnas_excel].to_excel(ARCHIVO_CAMBIOS, index=False)
-        print(f"¡Detectados {len(cambios)} cambios de precio entre mayoristas!")
+        log(f"¡Detectados {len(cambios)} cambios de precio entre mayoristas!")
     else:
-        print("Sin variaciones de precio en ningún mayorista.")
+        log("Sin variaciones de precio en ningún mayorista.")
 
     os.replace(ARCHIVO_NUEVO, ARCHIVO_HISTORICO)
 

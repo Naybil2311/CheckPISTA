@@ -14,7 +14,7 @@ ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
 URL_BASE = "https://pistacierto.com"
-URL_CATALOGO = "https://pistacierto.com/inicio"
+URL_BUSQUEDA_ASUS = "https://pistacierto.com/buscador?search=ASUS&page=1&size=100&order=1"
 
 def limpiar_numero(texto):
     if not texto:
@@ -41,7 +41,6 @@ def extraer_nombre_mayorista(imgs_alt_src):
     return "Mayorista Desconocido"
 
 async def cerrar_popups(page):
-    """Cierra modales SweetAlert2 (swal2) o avisos de cookies que bloqueen la pantalla."""
     for _ in range(3):
         try:
             modal = page.locator(".swal2-container.swal2-backdrop-show")
@@ -107,55 +106,21 @@ async def ejecutar_scraping():
 
         page = await context.new_page()
 
-        print(f"1. Entrando directamente al portal con sesión inyectada ({URL_CATALOGO})...")
-        await page.goto(URL_CATALOGO, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
-
-        if "/login" in page.url:
-            print("❌ La sesión guardada en PC_SESSION ha caducado o fue rechazada.")
-            await browser.close()
-            return False
-
-        print(f"2. ¡Acceso correcto sin bloqueo de IP! URL: {page.url}")
-
-        # Cerrar cualquier ventana emergente (SweetAlert2) que tape la pantalla
-        await cerrar_popups(page)
-
-        # Escribir ASUS en el buscador superior (#buscador_doesfinder)
-        buscador = page.locator("#buscador_doesfinder, input[placeholder*='Fabricante']:visible, input[placeholder*='Buscar']:visible").first
-        if await buscador.count() > 0:
-            await buscador.click(force=True)
-            await buscador.fill("ASUS")
-            await page.wait_for_timeout(1000)
-            await buscador.press("Enter")
-            await page.wait_for_timeout(1500)
-            btn_lupa = buscador.locator("xpath=following-sibling::button | ../button | ../..//button").first
-            if await btn_lupa.count() > 0:
-                try:
-                    await btn_lupa.click(force=True)
-                except Exception:
-                    pass
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(3000)
-
-        await cerrar_popups(page)
-
-        # Marcar filtro lateral de fabricante ASUS si existe
-        filtro_asus = page.locator("label:has-text('ASUS'), span:has-text('ASUS'), a:has-text('ASUS')").first
-        try:
-            if await filtro_asus.is_visible():
-                await filtro_asus.click(force=True)
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
         pagina_actual = 1
         while True:
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000)
-            print(f"3. Procesando página {pagina_actual} (URL: {page.url})...")
+            url_pagina = f"https://pistacierto.com/buscador?search=ASUS&page={pagina_actual}&size=100&order=1"
+            print(f"1. Cargando página {pagina_actual} ({url_pagina})...")
+            await page.goto(url_pagina, wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(3000)
 
+            if "/login" in page.url:
+                print("❌ La sesión guardada en PC_SESSION ha caducado o fue rechazada.")
+                await browser.close()
+                return False
+
+            await cerrar_popups(page)
+
+            # Desplegar todos los botones de mayoristas / sin stock
             botones_ver = page.locator("text=/Ver mayoristas|Sin stock/i")
             total_botones = await botones_ver.count()
             for i in range(total_botones):
@@ -163,103 +128,96 @@ async def ejecutar_scraping():
                     btn = botones_ver.nth(i)
                     if await btn.is_visible():
                         await btn.click(force=True)
-                        await page.wait_for_timeout(150)
+                        await page.wait_for_timeout(120)
                 except Exception:
                     continue
 
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(1500)
 
-            if pagina_actual == 1:
-                info_dom = await page.evaluate("""() => {
-                    const enlaces = document.querySelectorAll("a[href*='/productos/detalle/']").length;
-                    const textos = Array.from(document.querySelectorAll("div, span, p, a, li, td, h1, h2, h3, h4, h5, button"))
-                        .filter(el => el.offsetParent !== null && el.children.length === 0 && (el.innerText || "").trim().length > 3)
-                        .map(el => (el.innerText || "").trim())
-                        .slice(0, 40);
-                    return { enlacesDetalle: enlaces, muestraTextos: textos };
-                }""")
-                print(f"   Diagnóstico DOM: {info_dom['enlacesDetalle']} enlaces de detalle | Muestra textos: {info_dom['muestraTextos']}")
+            productos_pagina = await page.evaluate("""() => {
+                const tarjetas = [];
+                const enlacesProd = Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"));
+                const tarjetasVistas = new Set();
 
-            productos_pagina = []
-            for intento in range(3):
-                try:
-                    productos_pagina = await page.evaluate("""() => {
-                        const tarjetas = [];
-                        const enlacesProd = Array.from(document.querySelectorAll("a[href*='/productos/detalle/']"));
-                        const tarjetasVistas = new Set();
+                for (const enlace of enlacesProd) {
+                    const titulo = (enlace.innerText || "").trim();
+                    if (!titulo || titulo.length < 5) continue;
 
-                        for (const enlace of enlacesProd) {
-                            const titulo = (enlace.innerText || "").trim();
-                            if (!titulo || titulo.length < 5) continue;
-
-                            let cont = enlace.parentElement;
-                            let mejorCont = null;
-                            for (let nivel = 0; nivel < 8 && cont; nivel++) {
-                                const txt = cont.innerText || "";
-                                const enlacesEnCont = cont.querySelectorAll("a[href*='/productos/detalle/']").length;
-                                if (enlacesEnCont > 2) break;
-                                if (txt.includes("€")) {
-                                    mejorCont = cont;
-                                }
-                                cont = cont.parentElement;
-                            }
-
-                            if (!mejorCont || tarjetasVistas.has(mejorCont)) continue;
-                            tarjetasVistas.add(mejorCont);
-
-                            const textoTarjeta = mejorCont.innerText || "";
-                            const urlProd = enlace.href;
-
-                            const lineas = textoTarjeta.split("\\n").map(l => l.trim()).filter(Boolean);
-                            let pn = "";
-                            let esAsus = textoTarjeta.toUpperCase().includes("ASUS");
-
-                            for (const l of lineas) {
-                                if (/^[0-9A-Z]{2}[0-9A-Z]{4,8}-[0-9A-Z]{4,8}$/i.test(l)) {
-                                    pn = l;
-                                    break;
-                                }
-                            }
-
-                            const filasMayoristas = [];
-                            const candidatos = Array.from(mejorCont.querySelectorAll("div, tr, li")).filter(el => {
-                                const t = el.innerText || "";
-                                return t.includes("€") && t.length < 250;
-                            });
-
-                            const filasVistas = new Set();
-                            for (const fila of candidatos) {
-                                const t = (fila.innerText || "").trim();
-                                if (filasVistas.has(t)) continue;
-                                const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
-                                    const st = s.innerText || "";
-                                    return st.includes("€") && st.length < 250;
-                                });
-                                if (sub.length > 0) continue;
-                                filasVistas.add(t);
-
-                                const imgs = Array.from(fila.querySelectorAll("img")).map(img => [img.alt || "", img.src || ""]);
-                                filasMayoristas.push({ texto: t, imgs: imgs });
-                            }
-
-                            tarjetas.push({
-                                titulo: titulo,
-                                pn: pn,
-                                esAsus: esAsus,
-                                url: urlProd,
-                                textoCompleto: textoTarjeta,
-                                mayoristas: filasMayoristas
-                            });
+                    // Subir hasta el contenedor individual de la tarjeta (antes de englobar otra tarjeta)
+                    let cont = enlace.parentElement;
+                    let mejorCont = null;
+                    for (let nivel = 0; nivel < 10 && cont; nivel++) {
+                        const enlacesEnCont = cont.querySelectorAll("a[href*='/productos/detalle/']").length;
+                        if (enlacesEnCont > 2) break;
+                        const txt = cont.innerText || "";
+                        if (/\\d[\\d\\.]*,\\d{2}/.test(txt)) {
+                            mejorCont = cont;
                         }
-                        return tarjetas;
-                    }""")
-                    break
-                except Exception:
-                    print(f"   Reintentando lectura tras navegación interna ({intento + 1}/3)...")
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(2000)
+                        cont = cont.parentElement;
+                    }
 
+                    if (!mejorCont || tarjetasVistas.has(mejorCont)) continue;
+                    tarjetasVistas.add(mejorCont);
+
+                    const textoTarjeta = mejorCont.innerText || "";
+                    const urlProd = enlace.href;
+
+                    const lineas = textoTarjeta.split("\\n").map(l => l.trim()).filter(Boolean);
+                    let pn = "";
+                    let esAsus = textoTarjeta.toUpperCase().includes("ASUS");
+
+                    for (const l of lineas) {
+                        if (/^[0-9A-Z]{2}[0-9A-Z]{4,8}-[0-9A-Z]{4,8}$/i.test(l)) {
+                            pn = l;
+                            break;
+                        }
+                    }
+
+                    // Buscar filas de mayoristas o bloques con precio decimal (ej: 72,09 o 250,16 €)
+                    const filasMayoristas = [];
+                    const candidatos = Array.from(mejorCont.querySelectorAll("div, tr, li")).filter(el => {
+                        const t = (el.innerText || "").trim();
+                        return /\\d[\\d\\.]*,\\d{2}/.test(t) && t.length < 260;
+                    });
+
+                    const filasVistas = new Set();
+                    for (const fila of candidatos) {
+                        const t = (fila.innerText || "").trim();
+                        if (filasVistas.has(t)) continue;
+                        const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
+                            const st = (s.innerText || "").trim();
+                            return /\\d[\\d\\.]*,\\d{2}/.test(st) && st.length < 260;
+                        });
+                        if (sub.length > 0) continue;
+                        filasVistas.add(t);
+
+                        const imgs = Array.from(fila.querySelectorAll("img")).map(img => [img.alt || "", img.src || ""]);
+                        filasMayoristas.push({ texto: t, imgs: imgs });
+                    }
+
+                    tarjetas.push({
+                        titulo: titulo,
+                        pn: pn,
+                        esAsus: esAsus,
+                        url: urlProd,
+                        textoCompleto: textoTarjeta,
+                        mayoristas: filasMayoristas
+                    });
+                }
+                return tarjetas;
+            }""")
+
+            if pagina_actual == 1 and productos_pagina:
+                print(f"   Ejemplo tarjeta 1: Título='{productos_pagina[0]['titulo'][:45]}' | P/N='{productos_pagina[0]['pn']}' | Filas={len(productos_pagina[0]['mayoristas'])}")
+                if productos_pagina[0]['mayoristas']:
+                    print(f"   Ejemplo fila mayorista: {productos_pagina[0]['mayoristas'][0]}")
+
+            if not productos_pagina:
+                print(f"   No hay más productos en la página {pagina_actual}. Fin del recorrido.")
+                break
+
+            nuevos_en_pagina = 0
             for prod in productos_pagina:
                 if not prod["esAsus"]:
                     continue
@@ -274,8 +232,8 @@ async def ejecutar_scraping():
                     else:
                         mayorista = extraer_nombre_mayorista(imgs)
 
-                    precios_encontrados = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})\s*€", txt)
-                    m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€\s*canon", txt, re.I)
+                    precios_encontrados = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
+                    m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
                     m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
 
                     precio = limpiar_numero(precios_encontrados[0]) if precios_encontrados else None
@@ -295,28 +253,20 @@ async def ejecutar_scraping():
                             "Estado Stock": "Sin stock" if sin_stock else "Con stock",
                             "URL": prod["url"]
                         })
+                        nuevos_en_pagina += 1
 
-            print(f"   Acumulados hasta ahora: {len(registros)} registros (Producto x Mayorista)...")
+            print(f"   Página {pagina_actual}: +{nuevos_en_pagina} filas | Total acumulado: {len(registros)}")
 
-            btn_siguiente = page.locator("button:has-text('Siguiente'), a:has-text('Siguiente'), li.next:not(.disabled) a, button[aria-label*='Next']").first
-            if await btn_siguiente.count() > 0 and await btn_siguiente.is_enabled():
-                try:
-                    antes_count = len(registros)
-                    await btn_siguiente.click(force=True)
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(2500)
-                    if len(registros) == antes_count and pagina_actual > 1:
-                        break
-                    pagina_actual += 1
-                except Exception:
-                    break
-            else:
+            # Si devolvió menos de 100 productos, es la última página
+            if len(productos_pagina) < 100:
                 break
+
+            pagina_actual += 1
 
         await browser.close()
 
     if not registros:
-        print("No se extrajeron registros. Revisa el Diagnóstico DOM impreso arriba.")
+        print("No se extrajeron registros.")
         return False
 
     df = pd.DataFrame(registros).drop_duplicates(subset=["P/N", "Mayorista"])
@@ -334,7 +284,7 @@ async def ejecutar_scraping():
         df_acum = df.copy()
     df_acum.to_csv(ARCHIVO_ACUMULADO, index=False, sep=";", encoding="utf-8-sig")
 
-    print(f"4. Guardados {len(df)} registros (P/N x Mayorista) en {ruta_hist}")
+    print(f"4. Guardados {len(df)} registros únicos (P/N x Mayorista) en {ruta_hist}")
     return True
 
 def comparar_tarifas():

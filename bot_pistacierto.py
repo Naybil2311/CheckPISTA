@@ -280,28 +280,34 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
             for b in datos_dom["bloques"]:
                 txt = b["texto"]
                 ctx = b.get("texto_contexto", "")
-                texto_busqueda = f"{txt}\n{ctx}"
 
                 if re.search(r"(Sin Título|Tramitado|\bproductos\b)", txt, re.I):
                     continue
-                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", texto_busqueda, re.I):
+                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", f"{txt}\n{ctx}", re.I):
                     continue
 
-                mayorista = normalizar_mayorista(b["pistas"], texto_busqueda, b["html"])
+                # 1. Identificar mayorista usando las pistas de la fila (y respaldo del padre si aplica)
+                mayorista = normalizar_mayorista(b["pistas"], txt, b["html"])
+
+                # 2. Extraer precio, canon y stock EXCLUSIVAMENTE del texto propio de la fila (txt)
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
-                m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", texto_busqueda, re.I)
+                m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
+                if not m_canon:
+                    m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", ctx, re.I)
                 m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
 
                 precio = limpiar_numero(precios[0]) if precios else None
                 canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
                 stock = int(m_stock.group(1)) if m_stock else 0
-                sin_stock = bool(re.search(r"\bsin stock\b", txt, re.I)) or (stock == 0 and precio is not None and re.search(r"\bsin stock\b", texto_busqueda, re.I)) or precio == 0.0
+
+                # Solo es "Sin stock" si la propia fila dice "sin stock" y NO tiene unidades ("u.") > 0
+                sin_stock = (stock == 0) and (bool(re.search(r"\bsin stock\b", txt, re.I)) or precio == 0.0)
 
                 if sin_stock and not INCLUIR_SIN_STOCK:
                     continue
 
                 if precio is not None and precio > 0:
-                    estado_stock = "Sin stock" if sin_stock else ("Con stock" if stock > 0 else "Consultar")
+                    estado_stock = "Con stock" if stock > 0 else ("Sin stock" if sin_stock else "Consultar")
                     clave = (pn_final, mayorista, precio, stock, estado_stock)
                     if clave not in ofertas_ficha:
                         ofertas_ficha[clave] = {

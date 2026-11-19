@@ -52,54 +52,77 @@ async def ejecutar_scraping():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1600, "height": 1000})
+        context = await browser.new_context(
+            viewport={"width": 1600, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
         await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm}", lambda route: route.abort())
         page = await context.new_page()
+
+        # Capturar respuestas de red relacionadas con login/auth para diagnóstico real
+        respuestas_auth = []
+        async def on_response(response):
+            if any(k in response.url.lower() for k in ["login", "auth", "token", "usuario", "user", "session"]):
+                try:
+                    cuerpo = await response.text()
+                    respuestas_auth.append(f"[{response.status}] {response.url} -> {cuerpo[:250]}")
+                except Exception:
+                    respuestas_auth.append(f"[{response.status}] {response.url}")
+
+        page.on("response", on_response)
 
         print(f"1. Accediendo a {URL_LOGIN} para iniciar sesión...")
         await page.goto(URL_LOGIN, wait_until="networkidle", timeout=60000)
         await page.wait_for_selector("input[type='password']:visible", timeout=20000)
 
-        # Cerrar banner de cookies si bloquea la pantalla
+        # Cerrar banner de cookies si existe
         try:
             btn_cookies = page.locator("button:has-text('Aceptar'), button:has-text('Entendido'), button:has-text('Accept')").first
             if await btn_cookies.is_visible():
                 await btn_cookies.click()
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(400)
         except Exception:
             pass
 
-        # Seleccionar solo inputs visibles (evitando buscadores ocultos)
         input_pass = page.locator("input[type='password']:visible").first
-        # Buscar el campo de usuario/email visible justo antes del campo contraseña o dentro del mismo form
         form_padre = input_pass.locator("xpath=ancestor::form")
         if await form_padre.count() > 0:
             input_user = form_padre.locator("input:not([type='password']):not([type='hidden']):not([type='checkbox']):visible").first
         else:
             input_user = page.locator("input[type='email']:visible, input[type='text']:visible").first
 
+        # Rellenar y disparar eventos nativos de Angular (input, change, blur)
         await input_user.click()
-        await input_user.press_sequentially(usuario, delay=40)
+        await input_user.fill("")
+        await input_user.type(usuario, delay=50)
+        await input_user.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); el.blur(); }")
         await page.wait_for_timeout(300)
 
         await input_pass.click()
-        await input_pass.press_sequentially(password, delay=40)
-        await page.wait_for_timeout(500)
+        await input_pass.fill("")
+        await input_pass.type(password, delay=50)
+        await input_pass.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); el.blur(); }")
+        await page.wait_for_timeout(400)
 
-        # Pulsar el botón de envío dentro del formulario
-        if await form_padre.count() > 0:
-            btn_submit = form_padre.locator("button[type='submit'], button").first
-        else:
-            btn_submit = page.locator("button[type='submit']:visible, button:has-text('Iniciar'):visible, button:has-text('Acceder'):visible, button:has-text('Entrar'):visible").first
+        # Marcar checkbox "Mantener Conectado" si es visible
+        try:
+            chk = page.locator("input[type='checkbox']:visible").first
+            if await chk.count() > 0 and not await chk.is_checked():
+                await chk.click()
+        except Exception:
+            pass
 
-        if await btn_submit.count() > 0:
-            await btn_submit.click()
+        # Hacer clic específicamente en el botón "Acceder"
+        btn_acceder = page.locator("button:has-text('Acceder'):visible, input[type='submit']:visible, button[type='submit']:visible").first
+        print(f"   Botón encontrado: '{await btn_acceder.inner_text() if await btn_acceder.count() > 0 else 'Ninguno'}' | Habilitado: {await btn_acceder.is_enabled() if await btn_acceder.count() > 0 else False}")
+
+        if await btn_acceder.count() > 0:
+            await btn_acceder.click(force=True)
         else:
             await input_pass.press("Enter")
 
-        # Esperar redirección fuera de /login
         try:
-            await page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
+            await page.wait_for_url(lambda url: "/login" not in url, timeout=15000)
         except Exception:
             await page.wait_for_timeout(5000)
 
@@ -107,9 +130,16 @@ async def ejecutar_scraping():
         print(f"2. URL tras login: {page.url}")
 
         if "/login" in page.url:
-            texto_visible = await page.inner_text("body")
-            lineas_error = [l.strip() for l in texto_visible.split("\n") if l.strip()][:15]
-            print(f"Error: Sigue en /login. Texto en pantalla: {lineas_error}")
+            print("   Respuestas de red detectadas en el login:")
+            for r in respuestas_auth:
+                print(f"   -> {r}")
+            # Leer solo alertas/toasts o mensajes visibles reales (excluyendo modales ocultos)
+            mensajes_visibles = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('div, p, span, mat-error, .alert, .toast'))
+                    .filter(el => el.offsetParent !== null && el.children.length === 0 && el.innerText.trim().length > 2)
+                    .map(el => el.innerText.trim());
+            }""")
+            print(f"   Elementos visibles en pantalla: {mensajes_visibles}")
             await browser.close()
             return False
 

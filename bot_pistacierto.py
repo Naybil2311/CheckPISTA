@@ -13,9 +13,6 @@ ARCHIVO_CAMBIOS = "cambios_pistacierto.xlsx"
 ARCHIVO_ACUMULADO = "historico_maestro_pistacierto.csv"
 CARPETA_HISTORIAL = "historico"
 
-URL_BASE = "https://pistacierto.com"
-URL_BUSQUEDA_ASUS = "https://pistacierto.com/buscador?search=ASUS&page=1&size=100&order=1"
-
 def limpiar_numero(texto):
     if not texto:
         return None
@@ -27,18 +24,21 @@ def limpiar_numero(texto):
     m = re.search(r"\d+(?:\.\d+)?", txt)
     return float(m.group(0)) if m else None
 
-def extraer_nombre_mayorista(imgs_alt_src):
+def extraer_nombre_mayorista(imgs_alt_src, texto_fila=""):
+    up = texto_fila.upper()
+    if "PISTACERO" in up or "COMPRA AGRUPADA" in up:
+        return "PISTACERO (Compra Agrupada)"
     for alt, src in imgs_alt_src:
         alt_limpio = (alt or "").strip()
-        if alt_limpio and len(alt_limpio) > 1 and "logo" not in alt_limpio.lower():
+        if alt_limpio and len(alt_limpio) > 1 and not any(x in alt_limpio.lower() for x in ["logo", "producto", "asus", "sin imagen"]):
             return alt_limpio
-        if src:
+        if src and any(k in src.lower() for k in ["mayorista", "proveedor", "dist", "logo", "uploads"]):
             archivo = src.split("/")[-1].split("?")[0]
             nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
             nombre = re.sub(r"[-_]", " ", nombre).strip()
-            if nombre and len(nombre) > 1:
+            if nombre and len(nombre) > 1 and not nombre.isdigit():
                 return nombre.upper() if len(nombre) <= 4 else nombre.title()
-    return "Mayorista Desconocido"
+    return "Mejor Precio Portal"
 
 async def cerrar_popups(page):
     for _ in range(3):
@@ -50,12 +50,12 @@ async def cerrar_popups(page):
                     await btn_ok.click(force=True)
                 else:
                     await page.keyboard.press("Escape")
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(600)
             else:
                 break
         except Exception:
             await page.keyboard.press("Escape")
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(400)
 
 async def ejecutar_scraping():
     sesion_raw = os.environ.get("PC_SESSION", "").strip()
@@ -110,8 +110,21 @@ async def ejecutar_scraping():
         while True:
             url_pagina = f"https://pistacierto.com/buscador?search=ASUS&page={pagina_actual}&size=100&order=1"
             print(f"1. Cargando página {pagina_actual} ({url_pagina})...")
-            await page.goto(url_pagina, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(3000)
+
+            cargada = False
+            for intento in range(3):
+                try:
+                    await page.goto(url_pagina, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(3500)
+                    cargada = True
+                    break
+                except Exception as e:
+                    print(f"   Reintentando carga de página {pagina_actual} ({intento + 1}/3)...")
+                    await page.wait_for_timeout(2000)
+
+            if not cargada:
+                print(f"   No se pudo cargar la página {pagina_actual} tras 3 intentos. Deteniendo paginación.")
+                break
 
             if "/login" in page.url:
                 print("❌ La sesión guardada en PC_SESSION ha caducado o fue rechazada.")
@@ -120,7 +133,7 @@ async def ejecutar_scraping():
 
             await cerrar_popups(page)
 
-            # Desplegar todos los botones de mayoristas / sin stock
+            # Desplegar todos los botones de mayoristas / sin stock si están presentes
             botones_ver = page.locator("text=/Ver mayoristas|Sin stock/i")
             total_botones = await botones_ver.count()
             for i in range(total_botones):
@@ -128,12 +141,12 @@ async def ejecutar_scraping():
                     btn = botones_ver.nth(i)
                     if await btn.is_visible():
                         await btn.click(force=True)
-                        await page.wait_for_timeout(120)
+                        await page.wait_for_timeout(100)
                 except Exception:
                     continue
 
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(1500)
+            if total_botones > 0:
+                await page.wait_for_timeout(1500)
 
             productos_pagina = await page.evaluate("""() => {
                 const tarjetas = [];
@@ -144,7 +157,6 @@ async def ejecutar_scraping():
                     const titulo = (enlace.innerText || "").trim();
                     if (!titulo || titulo.length < 5) continue;
 
-                    // Subir hasta el contenedor individual de la tarjeta (antes de englobar otra tarjeta)
                     let cont = enlace.parentElement;
                     let mejorCont = null;
                     for (let nivel = 0; nivel < 10 && cont; nivel++) {
@@ -174,11 +186,11 @@ async def ejecutar_scraping():
                         }
                     }
 
-                    // Buscar filas de mayoristas o bloques con precio decimal (ej: 72,09 o 250,16 €)
+                    // Buscar filas de mayoristas que incluyan stock o logo, o el precio principal de la tarjeta
                     const filasMayoristas = [];
                     const candidatos = Array.from(mejorCont.querySelectorAll("div, tr, li")).filter(el => {
                         const t = (el.innerText || "").trim();
-                        return /\\d[\\d\\.]*,\\d{2}/.test(t) && t.length < 260;
+                        return /\\d[\\d\\.]*,\\d{2}/.test(t) && (t.includes("u.") || t.toLowerCase().includes("stock") || el.querySelectorAll("img").length > 0) && t.length < 280;
                     });
 
                     const filasVistas = new Set();
@@ -187,7 +199,7 @@ async def ejecutar_scraping():
                         if (filasVistas.has(t)) continue;
                         const sub = Array.from(fila.querySelectorAll("div, tr, li")).filter(s => {
                             const st = (s.innerText || "").trim();
-                            return /\\d[\\d\\.]*,\\d{2}/.test(st) && st.length < 260;
+                            return /\\d[\\d\\.]*,\\d{2}/.test(st) && (st.includes("u.") || st.toLowerCase().includes("stock") || s.querySelectorAll("img").length > 0) && st.length < 280;
                         });
                         if (sub.length > 0) continue;
                         filasVistas.add(t);
@@ -196,22 +208,22 @@ async def ejecutar_scraping():
                         filasMayoristas.push({ texto: t, imgs: imgs });
                     }
 
+                    // Si en la vista de buscador no hay subfilas con logo/stock, extraer el precio principal de la tarjeta
+                    if (filasMayoristas.length === 0) {
+                        const imgsTarjeta = Array.from(mejorCont.querySelectorAll("img")).map(img => [img.alt || "", img.src || ""]);
+                        filasMayoristas.push({ texto: textoTarjeta, imgs: imgsTarjeta });
+                    }
+
                     tarjetas.push({
                         titulo: titulo,
                         pn: pn,
                         esAsus: esAsus,
                         url: urlProd,
-                        textoCompleto: textoTarjeta,
                         mayoristas: filasMayoristas
                     });
                 }
                 return tarjetas;
             }""")
-
-            if pagina_actual == 1 and productos_pagina:
-                print(f"   Ejemplo tarjeta 1: Título='{productos_pagina[0]['titulo'][:45]}' | P/N='{productos_pagina[0]['pn']}' | Filas={len(productos_pagina[0]['mayoristas'])}")
-                if productos_pagina[0]['mayoristas']:
-                    print(f"   Ejemplo fila mayorista: {productos_pagina[0]['mayoristas'][0]}")
 
             if not productos_pagina:
                 print(f"   No hay más productos en la página {pagina_actual}. Fin del recorrido.")
@@ -227,10 +239,7 @@ async def ejecutar_scraping():
                     txt = m["texto"]
                     imgs = m["imgs"]
 
-                    if "PISTACERO" in txt.upper() or "COMPRA AGRUPADA" in txt.upper():
-                        mayorista = "PISTACERO (Compra Agrupada)"
-                    else:
-                        mayorista = extraer_nombre_mayorista(imgs)
+                    mayorista = extraer_nombre_mayorista(imgs, txt)
 
                     precios_encontrados = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
                     m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
@@ -239,7 +248,7 @@ async def ejecutar_scraping():
                     precio = limpiar_numero(precios_encontrados[0]) if precios_encontrados else None
                     canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
                     stock = int(m_stock.group(1)) if m_stock else 0
-                    sin_stock = "sin stock" in txt.lower() or stock == 0
+                    sin_stock = "sin stock" in txt.lower()
 
                     if precio is not None:
                         registros.append({
@@ -249,15 +258,14 @@ async def ejecutar_scraping():
                             "Mayorista": mayorista,
                             "Precio (€)": precio,
                             "Canon (€)": canon,
-                            "Stock": 0 if sin_stock else stock,
-                            "Estado Stock": "Sin stock" if sin_stock else "Con stock",
+                            "Stock": stock,
+                            "Estado Stock": "Sin stock" if sin_stock else ("Con stock" if stock > 0 else "Consultar"),
                             "URL": prod["url"]
                         })
                         nuevos_en_pagina += 1
 
-            print(f"   Página {pagina_actual}: +{nuevos_en_pagina} filas | Total acumulado: {len(registros)}")
+            print(f"   Página {pagina_actual}: +{nuevos_en_pagina} registros | Total acumulado: {len(registros)}")
 
-            # Si devolvió menos de 100 productos, es la última página
             if len(productos_pagina) < 100:
                 break
 

@@ -52,7 +52,8 @@ MAPA_MAYORISTAS_UUID = {
     "7898e114-5073-47c7-960f-36f9c65cfd02": "Globomatik",
 }
 
-INCLUIR_SIN_STOCK = False
+# Cambia a True si también quieres guardar en el CSV las filas marcadas como "Sin stock"
+INCLUIR_SIN_STOCK = True
 CONCURRENCIA_FICHAS = 8
 
 
@@ -95,12 +96,12 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
     combinado = " ".join(partes)
     combinado_up = combinado.upper()
 
-    # 1. Buscar coincidencia directa con UUID conocido en MAPA_MAYORISTAS_UUID
+    # 1. Coincidencia directa con UUID conocido en MAPA_MAYORISTAS_UUID
     for uuid_key, nombre_comercial in MAPA_MAYORISTAS_UUID.items():
         if uuid_key.lower() in combinado.lower():
             return nombre_comercial
 
-    # 2. Buscar nombres comerciales o palabras clave conocidas
+    # 2. Coincidencia directa por nombre comercial visible o en atributos/clases
     mapa_texto = [
         ("PISTACERO", "PISTACERO (Compra Agrupada)"),
         ("COMPRA AGRUPADA", "PISTACERO (Compra Agrupada)"),
@@ -141,7 +142,7 @@ def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
         if clave in combinado_up:
             return nombre_limpio
 
-    # 3. Extraer UUID de URLs de /mayoristas/<uuid>.<ext>
+    # 3. Extraer UUID de URLs /mayoristas/<uuid>.<ext>
     m_uuid = re.search(
         r"/mayoristas/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
         combinado,
@@ -207,7 +208,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     let fila = hoja.closest("tr");
                     if (!fila) {
                         let cur = hoja.parentElement;
-                        for (let nivel = 0; nivel < 6 && cur; nivel++) {
+                        for (let nivel = 0; nivel < 7 && cur; nivel++) {
                             const imgs = cur.querySelectorAll("img").length;
                             const preciosEnFila = (cur.innerText || "").match(/\\d[\\d\\.]*,\\d{2}/g) || [];
                             if (preciosEnFila.length > 3) break;
@@ -224,36 +225,45 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     filasVistas.add(contenedor);
 
                     const pistas = [];
-                    contenedor.querySelectorAll("*").forEach(nodo => {
-                        if (nodo.tagName === "IMG") {
-                            for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
-                                const val = nodo.getAttribute(attr);
-                                if (val && val.trim()) pistas.push(val.trim());
-                            }
-                        }
-                        const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
-                        if (bg && bg !== "none") pistas.push(bg);
-                        const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
-                        if (aria.trim()) pistas.push(aria.trim());
-                    });
-
-                    if (pistas.length === 0 && contenedor.parentElement) {
-                        contenedor.parentElement.querySelectorAll("img, *").forEach(nodo => {
+                    const recolectarDeAmbito = (ambito, soloMayoristas = false) => {
+                        if (!ambito) return;
+                        ambito.querySelectorAll("*").forEach(nodo => {
                             if (nodo.tagName === "IMG") {
                                 for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
                                     const val = nodo.getAttribute(attr);
-                                    if (val && val.includes("mayoristas")) pistas.push(val.trim());
+                                    if (val && val.trim()) {
+                                        if (!soloMayoristas || val.toLowerCase().includes("mayorista")) {
+                                            pistas.push(val.trim());
+                                        }
+                                    }
                                 }
                             }
                             const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
-                            if (bg && bg.includes("mayoristas")) pistas.push(bg);
+                            if (bg && bg !== "none") {
+                                if (!soloMayoristas || bg.toLowerCase().includes("mayorista")) {
+                                    pistas.push(bg);
+                                }
+                            }
+                            const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
+                            if (aria.trim()) pistas.push(aria.trim());
+                            const cls = typeof nodo.className === "string" ? nodo.className : "";
+                            if (cls && cls.toLowerCase().includes("mayorista")) pistas.push(cls);
                         });
+                    };
+
+                    recolectarDeAmbito(contenedor, false);
+                    if (contenedor.parentElement) {
+                        recolectarDeAmbito(contenedor.parentElement, true);
                     }
 
+                    const textoFila = (contenedor.innerText || "").trim();
+                    const textoPadre = (contenedor.parentElement?.innerText || "").trim();
+
                     bloques.push({
-                        texto: (contenedor.innerText || "").trim(),
+                        texto: textoFila,
+                        texto_contexto: textoPadre.slice(0, 1200),
                         pistas: pistas,
-                        html: contenedor.outerHTML.slice(0, 900)
+                        html: contenedor.outerHTML.slice(0, 1000)
                     });
                 }
 
@@ -269,26 +279,30 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
             ofertas_ficha = {}
             for b in datos_dom["bloques"]:
                 txt = b["texto"]
+                ctx = b.get("texto_contexto", "")
+                texto_busqueda = f"{txt}\n{ctx}"
+
                 if re.search(r"(Sin Título|Tramitado|\bproductos\b)", txt, re.I):
                     continue
-                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir)", txt, re.I):
+                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", texto_busqueda, re.I):
                     continue
 
-                mayorista = normalizar_mayorista(b["pistas"], txt, b["html"])
+                mayorista = normalizar_mayorista(b["pistas"], texto_busqueda, b["html"])
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
-                m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
+                m_canon = re.search(r"\+\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", texto_busqueda, re.I)
                 m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
 
                 precio = limpiar_numero(precios[0]) if precios else None
                 canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
                 stock = int(m_stock.group(1)) if m_stock else 0
-                sin_stock = "sin stock" in txt.lower() or precio == 0.0
+                sin_stock = bool(re.search(r"\bsin stock\b", txt, re.I)) or (stock == 0 and precio is not None and re.search(r"\bsin stock\b", texto_busqueda, re.I)) or precio == 0.0
 
                 if sin_stock and not INCLUIR_SIN_STOCK:
                     continue
 
                 if precio is not None and precio > 0:
-                    clave = (pn_final, mayorista, precio)
+                    estado_stock = "Sin stock" if sin_stock else ("Con stock" if stock > 0 else "Consultar")
+                    clave = (pn_final, mayorista, precio, stock, estado_stock)
                     if clave not in ofertas_ficha:
                         ofertas_ficha[clave] = {
                             "Fecha": fecha_ejecucion,
@@ -298,7 +312,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                             "Precio (€)": precio,
                             "Canon (€)": canon,
                             "Stock": stock,
-                            "Estado Stock": "Sin stock" if sin_stock else ("Con stock" if stock > 0 else "Consultar"),
+                            "Estado Stock": estado_stock,
                             "URL": url_prod
                         }
 
@@ -453,7 +467,7 @@ async def ejecutar_scraping():
         log("No se extrajeron ofertas de mayoristas.")
         return False
 
-    df = pd.DataFrame(registros).drop_duplicates(subset=["P/N", "Mayorista", "Precio (€)"])
+    df = pd.DataFrame(registros).drop_duplicates(subset=["P/N", "Mayorista", "Precio (€)", "Stock", "Estado Stock"])
     df.to_csv(ARCHIVO_NUEVO, index=False, sep=";", encoding="utf-8-sig")
 
     os.makedirs(CARPETA_HISTORIAL, exist_ok=True)

@@ -37,7 +37,7 @@ EXCLUIR_ACCESORIOS = [
 ]
 
 INCLUIR_SIN_STOCK = False
-CONCURRENCIA_FICHAS = 6
+CONCURRENCIA_FICHAS = 8
 
 def log(msg):
     print(msg, flush=True)
@@ -67,11 +67,12 @@ def es_equipo_valido(titulo):
     ]
     return any(c in up for c in claves_ok)
 
-def normalizar_mayorista(imgs_info=None, texto_fila="", html_fila=""):
-    combinado = f"{texto_fila or ''} {html_fila or ''}".upper()
-    if imgs_info:
-        for item in imgs_info:
-            combinado += " " + " ".join(str(x or "") for x in item).upper()
+def normalizar_mayorista(pistas_fila=None, texto_fila="", html_fila=""):
+    partes = [texto_fila or "", html_fila or ""]
+    if pistas_fila:
+        for p in pistas_fila:
+            partes.append(str(p or ""))
+    combinado = " ".join(partes).upper()
 
     mapa = [
         ("PISTACERO", "PISTACERO (Compra Agrupada)"),
@@ -110,20 +111,21 @@ def normalizar_mayorista(imgs_info=None, texto_fila="", html_fila=""):
         if clave in combinado:
             return nombre_limpio
 
-    if imgs_info:
-        for alt, title, src, data_src in imgs_info:
-            for cand in [alt, title]:
-                c = (cand or "").strip()
-                if c and len(c) > 1 and not any(x in c.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon", "carrito", "añadir"]):
-                    return c
-            for url_img in [src, data_src]:
-                if url_img and not url_img.startswith("data:"):
-                    archivo = url_img.split("/")[-1].split("?")[0]
-                    nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
-                    nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
-                    nombre = re.sub(r"[-_]", " ", nombre).strip()
-                    if nombre and len(nombre) > 1 and not nombre.isdigit():
-                        return nombre.upper() if len(nombre) <= 4 else nombre.title()
+    if pistas_fila:
+        for pista in pistas_fila:
+            s = str(pista or "").strip()
+            if not s or s.startswith("data:") or s.startswith("http"):
+                continue
+            # Limpiar nombres de archivo si vienen en pista
+            if "/" in s or "\\" in s:
+                archivo = s.split("/")[-1].split("\\")[-1].split("?")[0]
+                nombre = re.sub(r"\.(png|jpg|jpeg|svg|webp)$", "", archivo, flags=re.I)
+                nombre = re.sub(r"^(logo[-_]?|mayorista[-_]?|prov[-_]?|dist[-_]?)", "", nombre, flags=re.I)
+                nombre = re.sub(r"[-_]", " ", nombre).strip()
+                if nombre and len(nombre) > 1 and not nombre.isdigit():
+                    return nombre.upper() if len(nombre) <= 4 else nombre.title()
+            elif len(s) > 1 and not s.isdigit() and not any(x in s.lower() for x in ["logo", "producto", "asus", "sin imagen", "icon", "carrito", "añadir", "row", "col", "flex", "btn", "text", "card", "ng-"]):
+                return s
 
     return "Mayorista Desconocido"
 
@@ -151,7 +153,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
 
         try:
             await page.goto(url_prod, wait_until="domcontentloaded", timeout=35000)
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(1200)
             await cerrar_popups(page)
 
             datos_dom = await page.evaluate("""() => {
@@ -163,7 +165,6 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 const mPn = bodyTxt.match(/P\\/N:\\s*([A-Z0-9\\-\\.]+)/i);
                 if (mPn) pn = mPn[1].trim();
 
-                // Localizar cada nodo de precio decimal (ej: 269,00) y subir hasta su fila completa (tr o div con <img>)
                 const bloques = [];
                 const hojasPrecio = Array.from(document.querySelectorAll("div, span, td, p, strong, b")).filter(el => {
                     const t = (el.innerText || "").trim();
@@ -172,14 +173,12 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
 
                 const filasVistas = new Set();
                 for (const hoja of hojasPrecio) {
-                    // Subir hasta el <tr> o contenedor de fila individual que incluye logo <img> + precio + stock + botón
                     let fila = hoja.closest("tr");
                     if (!fila) {
                         let cur = hoja.parentElement;
                         for (let nivel = 0; nivel < 6 && cur; nivel++) {
                             const imgs = cur.querySelectorAll("img").length;
                             const preciosEnFila = (cur.innerText || "").match(/\\d[\\d\\.]*,\\d{2}/g) || [];
-                            // Si engloba varios mayoristas distintos (más de 3 precios incluyendo canon), parar antes
                             if (preciosEnFila.length > 3) break;
                             if (imgs > 0) {
                                 fila = cur;
@@ -193,17 +192,25 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                     if (!contenedor || filasVistas.has(contenedor)) continue;
                     filasVistas.add(contenedor);
 
-                    const imgs = Array.from(contenedor.querySelectorAll("img")).map(img => [
-                        img.alt || "",
-                        img.title || "",
-                        img.src || "",
-                        img.getAttribute("data-src") || ""
-                    ]);
+                    const pistas = [];
+                    // Recoger atributos de <img> y background-image en estilos inline/computados
+                    contenedor.querySelectorAll("*").forEach(nodo => {
+                        if (nodo.tagName === "IMG") {
+                            for (const attr of ["alt", "title", "src", "data-src", "aria-label"]) {
+                                const val = nodo.getAttribute(attr);
+                                if (val && val.trim()) pistas.push(val.trim());
+                            }
+                        }
+                        const bg = getComputedStyle(nodo).backgroundImage || nodo.style.backgroundImage || "";
+                        if (bg && bg !== "none") pistas.push(bg);
+                        const aria = nodo.getAttribute("aria-label") || nodo.getAttribute("data-mayorista") || nodo.getAttribute("data-proveedor") || "";
+                        if (aria.trim()) pistas.push(aria.trim());
+                    });
 
                     bloques.push({
                         texto: (contenedor.innerText || "").trim(),
-                        imgs: imgs,
-                        html: contenedor.outerHTML.slice(0, 700)
+                        pistas: pistas,
+                        html: contenedor.outerHTML.slice(0, 900)
                     });
                 }
 
@@ -222,7 +229,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir)", txt, re.I):
                     continue
 
-                mayorista = normalizar_mayorista(b["imgs"], txt, b["html"])
+                mayorista = normalizar_mayorista(b["pistas"], txt, b["html"])
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
                 m_canon = re.search(r"\+(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
                 m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
@@ -254,10 +261,8 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
 
             if idx == 0:
                 log(f"   [Diagnóstico Ficha 1] P/N: {pn_final} | Filas extraídas: {len(filas_resultado)}")
-                if filas_resultado:
-                    log(f"   [Diagnóstico Ficha 1] Ejemplo oferta 1: {filas_resultado[0]}")
-                if datos_dom["bloques"]:
-                    log(f"   [Diagnóstico Ficha 1] Imgs fila 1: {datos_dom['bloques'][0]['imgs']}")
+                for i_b, b in enumerate(datos_dom["bloques"][:4]):
+                    log(f"      -> Fila {i_b+1} pistas: {b['pistas']} | texto: {b['texto'].replace(chr(10), ' | ')[:140]}")
 
         except Exception as e:
             if idx == 0:
@@ -323,7 +328,7 @@ async def ejecutar_scraping():
             url_inicio = f"https://pistacierto.com/buscador?search={quote(termino)}&size=100"
             try:
                 await page.goto(url_inicio, wait_until="domcontentloaded", timeout=35000)
-                await page.wait_for_timeout(2500)
+                await page.wait_for_timeout(1500)
             except Exception:
                 continue
 
@@ -363,7 +368,7 @@ async def ejecutar_scraping():
                             break
                         primer_antes = enlaces[0]["url"]
                         await btn_next.click(force=True)
-                        await page.wait_for_timeout(2500)
+                        await page.wait_for_timeout(1500)
 
                         primer_despues = await page.evaluate("""() => {
                             const a = document.querySelector("a[href*='/productos/detalle/']");

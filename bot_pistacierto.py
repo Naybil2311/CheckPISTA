@@ -26,7 +26,7 @@ TERMINOS_BUSQUEDA = [
     "90PT",
     "90MS",
     "90NB",
-    "90NR"
+    "90NR",
 ]
 
 EXCLUIR_ACCESORIOS = [
@@ -36,7 +36,7 @@ EXCLUIR_ACCESORIOS = [
     "ADAPTADOR", "TECLADO", "KEYBOARD", "AURICULAR", "HEADSET", "WEBCAM",
     "PROYECTOR", "ROUTER", "EXPERTWIFI", "CONMUTADOR", "SWITCH", "VIVOWATCH",
     "ZENDRIVE", "GRABADORA", "PLACA BASE", "TARJETA", "CAJA ", "TORRE PEQUEÑA",
-    "FUENTE DE ALIMENTACION", "CARGADOR", "DOCK", "MALETIN", "MALETÍN"
+    "FUENTE DE ALIMENTACION", "CARGADOR", "DOCK", "MALETIN", "MALETÍN",
 ]
 
 MAPA_MAYORISTAS_UUID = {
@@ -103,14 +103,14 @@ def precio_oficial_valido(valor):
 
 
 def es_equipo_valido(titulo):
-    up = titulo.upper()
+    up = (titulo or "").upper()
     if any(exc in up for exc in EXCLUIR_ACCESORIOS):
         return False
     claves_ok = [
         "ASUS", "EXPERTBOOK", "EXPERTCENTER", "ASUSPRO", "ZENBOOK",
         "VIVOBOOK", "CHROMEBOOK", "PORTATIL", "PORTÁTIL", "ORDENADOR",
         "NOTEBOOK", "AIO", "ALL IN ONE", "MINI PC", "MINIPC",
-        "90NX", "90PF", "90PT", "90MS", "90NB", "90NR"
+        "90NX", "90PF", "90PT", "90MS", "90NB", "90NR",
     ]
     return any(c in up for c in claves_ok)
 
@@ -209,16 +209,20 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
 
         try:
             await page.goto(url_prod, wait_until="domcontentloaded", timeout=35000)
+            try:
+                await page.wait_for_selector("h1, h2, .product-title, .titulo-producto", timeout=6000)
+            except Exception:
+                pass
             await page.wait_for_timeout(1200)
             await cerrar_popups(page)
 
             datos_dom = await page.evaluate("""() => {
                 const bodyTxt = document.body.innerText || "";
                 const h1 = document.querySelector("h1, h2, .product-title, .titulo-producto");
-                const titulo = h1 ? (h1.innerText || "").trim() : "";
+                const titulo = h1 ? (h1.innerText || "").replace(/\\s+/g, " ").trim() : "";
 
                 let pn = "";
-                const mPn = bodyTxt.match(/P\\/N:\\s*([A-Z0-9\\-\\.]+)/i);
+                const mPn = bodyTxt.match(/(?:P\\/N|Part\\s*Number|PartNumber)\\s*[:\\-]?\\s*([A-Z0-9\\-\\.]{5,25})/i);
                 if (mPn) pn = mPn[1].trim();
 
                 const bloques = [];
@@ -276,10 +280,10 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                 return { titulo: titulo, pn: pn, bloques: bloques };
             }""")
 
-            titulo_final = datos_dom["titulo"] or titulo_previo
-            pn_final = datos_dom["pn"]
+            titulo_final = (datos_dom["titulo"] or titulo_previo or "").strip()
+            pn_final = (datos_dom["pn"] or "").strip().upper()
             if not pn_final:
-                m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{4,10}-[A-Z0-9]{4,10})\b", titulo_final)
+                m_pn_tit = re.search(r"\b(90[A-Z0-9]{2}[A-Z0-9\-]{4,14}|[A-Z0-9]{4,10}-[A-Z0-9]{4,10})\b", titulo_final.upper())
                 pn_final = m_pn_tit.group(1) if m_pn_tit else titulo_final[:35]
 
             ofertas_ficha = {}
@@ -288,14 +292,12 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
 
                 if re.search(r"(Sin Título|Tramitado|\bproductos\b)", txt, re.I):
                     continue
-                if not re.search(r"(u\.|canon|SKU|PISTACERO|stock|Añadir|Sin stock)", txt, re.I):
-                    continue
 
                 mayorista = normalizar_mayorista(b["pistas"], txt, b["html"])
 
                 precios = re.findall(r"(?<!\+)(\d[\d\.]*,\d{2})", txt)
                 m_canon = re.search(r"\+?\s*(\d[\d\.]*[,\.]\d{2})\s*€?\s*canon", txt, re.I)
-                m_stock = re.search(r"(\d+)\s*u\.", txt, re.I)
+                m_stock = re.search(r"(\d+)\s*(?:u\.|uds|unidades)", txt, re.I)
 
                 precio = limpiar_numero(precios[0]) if precios else None
                 canon = limpiar_numero(m_canon.group(1)) if m_canon else 0.0
@@ -318,7 +320,7 @@ async def extraer_ficha_producto(context, sem, idx, url_prod, titulo_previo, fec
                             "Canon (€)": canon,
                             "Stock": stock,
                             "Estado Stock": estado_stock,
-                            "URL": url_prod
+                            "URL": url_prod,
                         }
 
             filas_resultado.extend(ofertas_ficha.values())
@@ -359,9 +361,12 @@ async def ejecutar_scraping():
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             viewport={"width": 1600, "height": 1000},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
-        await context.route("**/*.{woff,woff2,ttf,eot,mp4,webm,png,jpg,jpeg,webp,gif,svg}", lambda route: route.abort())
+        await context.route(
+            "**/*.{woff,woff2,ttf,eot,mp4,webm,png,jpg,jpeg,webp,gif,svg}",
+            lambda route: route.abort(),
+        )
 
         cookies_str = datos_sesion.get("cookies", "")
         if cookies_str:
@@ -373,7 +378,7 @@ async def ejecutar_scraping():
                         "name": k,
                         "value": v,
                         "domain": "pistacierto.com",
-                        "path": "/"
+                        "path": "/",
                     })
             if lista_cookies:
                 await context.add_cookies(lista_cookies)
@@ -522,10 +527,9 @@ def contrastar_con_pvdr(df_ofertas, ruta_pvd=ARCHIVO_PVD):
     df_pvd["PVDR_num"] = pvdr_series
     df_pvd["PvD_Promo_num"] = promo_series
 
-    # Prioridad: PvD Promo válido (> 0), si no PVDR válido (> 0). Ignora filas sin precio ("No en pricelist", etc.)
     df_pvd["Ref_Precio_num"] = df_pvd["PvD_Promo_num"].where(
         df_pvd["PvD_Promo_num"].notna(),
-        df_pvd["PVDR_num"]
+        df_pvd["PVDR_num"],
     )
     df_pvd["Tipo_Ref"] = df_pvd["PvD_Promo_num"].apply(
         lambda x: "PvD Promo" if pd.notna(x) else "PVDR"
@@ -575,7 +579,7 @@ def contrastar_con_pvdr(df_ofertas, ruta_pvd=ARCHIVO_PVD):
             "Precio (€)", "Canon (€)", "Tipo_Ref", "Ref_Precio_num",
             "PvD_Promo_num", "PVDR_num",
             "Dif vs Ref (€)", "Desv Ref (%)",
-            "Stock", "Estado Stock", "Fecha", "URL"
+            "Stock", "Estado Stock", "Fecha", "URL",
         ]
         cols_finales = [c for i, c in enumerate(cols_orden) if c and c in bajo_ref.columns and c not in cols_orden[:i]]
         bajo_ref[cols_finales].to_excel(ARCHIVO_BAJO_PVD, index=False)
@@ -589,8 +593,6 @@ def comparar_tarifas():
         os.remove(ARCHIVO_CAMBIOS)
 
     df_nuevo = pd.read_csv(ARCHIVO_NUEVO, sep=";", encoding="utf-8-sig")
-
-    # Contrastar siempre contra la tarifa oficial (priorizando PvD Promo)
     contrastar_con_pvdr(df_nuevo)
 
     if not os.path.exists(ARCHIVO_HISTORICO):
@@ -605,7 +607,7 @@ def comparar_tarifas():
         df_ant[["P/N", "Mayorista", "Precio (€)", "Stock"]],
         on=["P/N", "Mayorista"],
         how="inner",
-        suffixes=(" Nuevo", " Anterior")
+        suffixes=(" Nuevo", " Anterior"),
     )
 
     cambios = cruce[abs(cruce["Precio (€) Nuevo"] - cruce["Precio (€) Anterior"]) >= 0.01].copy()
@@ -617,9 +619,10 @@ def comparar_tarifas():
         columnas_excel = [
             "P/N", "Modelo", "Mayorista",
             "Precio (€) Anterior", "Precio (€) Nuevo", "Diferencia (€)", "Variación (%)",
-            "Canon (€)", "Stock Anterior", "Stock Nuevo", "Estado Stock", "Fecha", "URL"
+            "Canon (€)", "Stock Anterior", "Stock Nuevo", "Estado Stock", "Fecha", "URL",
         ]
-        cambios[columnas_excel].to_excel(ARCHIVO_CAMBIOS, index=False)
+        cols_existentes = [c for c in columnas_excel if c in cambios.columns]
+        cambios[cols_existentes].to_excel(ARCHIVO_CAMBIOS, index=False)
         log(f"¡Detectados {len(cambios)} cambios de precio entre mayoristas!")
     else:
         log("Sin variaciones de precio en ningún mayorista.")
